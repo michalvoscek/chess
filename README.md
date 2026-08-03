@@ -1,0 +1,160 @@
+# Chess AI
+
+Goal of the project is to take input ELO and generate moves like real human with that elo would do.
+
+## Input and output
+
+Application should accept input:
+1. elo of game
+2. current position (in FEN format)
+3. last 5 moves (in PGN format)
+
+and return output:
+1. probabilities for all legal moves in given position
+
+## Scripts
+
+### Download
+Download database from lichess
+
+```bash
+python download_lichess_db.py --start 2026-05 --end 2026-05
+```
+
+### Train data
+decompress game files
+```bash
+python process_lichess_db.py --max-games 1000000
+```
+
+Instead of one sample per game, create one sample for every move.
+
+Game:
+```
+e4
+e5
+Nf3
+Nc6
+Bb5
+a6
+Ba4
+```
+
+becomes
+
+Input
+```
+<GAME_ELO_1800>
+
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+
+<NONE> <NONE> <NONE> <NONE> <NONE>
+```
+
+Output
+
+```
+e4
+```
+
+Input
+
+```
+<GAME_ELO_1800>
+
+rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1
+
+<NONE> <NONE> <NONE> <NONE> e4
+```
+
+Output
+
+```
+e5
+```
+
+Input
+```
+<GAME_ELO_1800>
+
+rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2
+
+<NONE> <NONE> <NONE> e4 e5
+
+```
+Output
+
+```
+Nf3
+```
+
+### Tokenization
+
+For FEN position use per character tokenization.
+
+For moves use one token per move.
+
+Good examples
+```
+e4
+Nf3
+Bb5
+O-O
+Qxe5+
+```
+
+Avoid character-level tokenization.
+
+Special tokens:
+
+```
+<NONE>
+<GAME_ELO_1200>
+```
+
+## Train
+
+### Model
+Decoder-only Transformer
+
+Layers:          12
+Hidden Size:     512
+Attention Heads: 8
+FFN Size:        2048
+Context:         512 tokens
+Parameters:      ~45–60M
+
+```bash
+python train.py
+```
+flags:
+--epochs: n - how many times to go thru training data
+--lr: r - default 0.0003, how much should training affect weights
+--device: cpu or gpu:1 what device to use for training
+
+### Resuming after data changes (planned)
+
+When `data/train.jsonl` is replaced with new games, continue training from
+the old weights instead of random init.
+
+Important: It might be needed to extend move set vocabulary for new moves not seen in previous training data.
+
+```bash
+python train.py --init-from data/model --epochs 1 --lr 3e-4
+```
+
+--init-from: path - initialize weights from this checkpoint (file or prefix);
+optimizer and lr schedule start fresh
+--offset: n - start at game n of the data stream (default 0)
+
+
+## Inference
+
+```bash
+python infer.py --elo 1800 --pgn "1. e4 e5 2. Nf3 *"
+```
+
+flags:
+--elo: target elo of the player to move
+--pgn: game so far in pgn format (use "*" for the start position)
+--model: checkpoint file or prefix (default: latest under data/model)
