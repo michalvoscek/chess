@@ -134,9 +134,9 @@ Parameters:      ~45–60M
 python train.py
 ```
 flags:
---epochs: n - how many times to go thru training data
---lr: r - default 0.0003, how much should training affect weights
---device: cpu or gpu:1 what device to use for training
+--epochs: n - how many times to go thru training data  
+--lr: r - default 0.0003, how much should training affect weights  
+--device: cpu or gpu:1 what device to use for training  
 
 ### Resuming after data changes
 
@@ -162,11 +162,14 @@ python train.py --epochs 1 --lr 3e-4
 
 ## Inference
 
+Program should interpret game so far, calculate current position and last 5 moves.  
+Then for every legal move it should run thru model to calculate probability of that move.
+
 ```bash
 python infer.py --elo 1800 --pgn "1. e4 e5 2. Nf3 *"
 ```
 
-flags:
---elo: target elo of the player to move
---pgn: game so far in pgn format (use "*" for the start position)
---model: checkpoint file or prefix (default: latest under data/model)
+flags:  
+--elo: target elo of the player to move  
+--pgn: game so far in pgn format  
+--model: checkpoint file or prefix (default: latest)  
