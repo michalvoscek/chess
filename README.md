@@ -44,7 +44,7 @@ becomes
 
 Input
 ```
-<GAME_ELO_1800>
+<PLAYER_ELO_1800>
 
 rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 
@@ -60,7 +60,7 @@ e4
 Input
 
 ```
-<GAME_ELO_1800>
+<PLAYER_ELO_1800>
 
 rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1
 
@@ -75,7 +75,7 @@ e5
 
 Input
 ```
-<GAME_ELO_1800>
+<PLAYER_ELO_1800>
 
 rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2
 
@@ -109,10 +109,16 @@ Special tokens:
 
 ```
 <NONE>
-<GAME_ELO_1200>
+<PLAYER_ELO_1200>
 ```
 
 ## Train
+
+### Optimizer
+
+AdamW
+
+Weight decay     0.1
 
 ### Model
 Decoder-only Transformer
@@ -132,21 +138,27 @@ flags:
 --lr: r - default 0.0003, how much should training affect weights
 --device: cpu or gpu:1 what device to use for training
 
-### Resuming after data changes (planned)
+### Resuming after data changes
 
 When `data/train.jsonl` is replaced with new games, continue training from
 the old weights instead of random init.
 
-Important: It might be needed to extend move set vocabulary for new moves not seen in previous training data.
+Important: It might be needed to extend move set vocabulary for new moves not seen in previous training data.  
+Store vocab with checkpoint.  
+Keep existing IDs stable.  
+Initialize new weights at random.  
+Build vocab before training from train.jsonl.  
+
+For ELO there should be be predefined tokens from `<PLAYER_ELO_0>` to `<PLAYER_ELO_4000>` incrementing by 100. So extending is not needed here.
+
+For training data fingerprint should be calculated so using sha256 of `train.jsonl`
 
 ```bash
-python train.py --init-from data/model --epochs 1 --lr 3e-4
+python train.py --epochs 1 --lr 3e-4
 ```
 
---init-from: path - initialize weights from this checkpoint (file or prefix);
-optimizer and lr schedule start fresh
---offset: n - start at game n of the data stream (default 0)
-
+--resume: initialize latest checkpoint based on training data fingerprint and offset in train samples stream automatically saved;
+--checkpoint-cadence: number, after how many samples should checkpoint be created
 
 ## Inference
 
