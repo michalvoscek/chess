@@ -18,8 +18,13 @@ and return output:
 Download database from lichess
 
 ```bash
-python download_lichess_db.py --start 2026-05 --end 2026-05
+python download_lichess_db.py --month 2026-05
 ```
+
+Should save data to `data/lichess_db_standard_rated_2026-05.pgn.zst`  
+Files can be large verify available disk size first.  
+Download should be resumable.  
+Download progress should be displayed on standard output.  
 
 ### Train data
 decompress game files
