@@ -1,6 +1,7 @@
 # Chess AI
 
-Goal of the project is to take input ELO and generate moves like real human with that elo would do.
+Goal of the project is to take input ELO and generate moves like real human with that elo would do.  
+Use python venv.  
 
 ## Input and output
 
