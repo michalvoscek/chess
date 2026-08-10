@@ -33,7 +33,15 @@ decompress game files
 python process_lichess_db.py --max-games 1000000
 ```
 
-Instead of one sample per game, create one sample for every move.
+Instead of one sample per game, create one sample for every move.  
+Output should be jsonl files.  
+Output should be 2 files train.jsonl and eval.jsonl games split 90/10.  
+Skips game if unable to extract some information (like ELO).  
+Use nearest 100 ELO bracket.  
+args:
+--max-games: limit games in output files
+--input: source `.pgn.zst` file
+
 
 Game:
 ```
@@ -94,6 +102,12 @@ Output
 Nf3
 ```
 
+Example row in train/eval data:
+
+```json
+{"elo":1800,"fen":"...","history":["<NONE>","<NONE>","<NONE>","<NONE>","e4"],"move":"e5"}
+```
+
 ### Tokenization
 
 For FEN position use per character tokenization.
@@ -116,6 +130,7 @@ Special tokens:
 ```
 <NONE>
 <PLAYER_ELO_1200>
+etc.
 ```
 
 ## Train
