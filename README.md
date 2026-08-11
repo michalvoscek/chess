@@ -103,12 +103,12 @@ Weight decay     0.1
 ### Model
 Decoder-only Transformer
 
-Layers:          12
-Hidden Size:     512
-Attention Heads: 8
-FFN Size:        2048
-Context:         512 tokens
-Parameters:      ~45–60M
+Layers:                                12
+Hidden Size (embedding dimension):     512
+Attention Heads:                       8
+FFN Size (4× hidden size):             2048
+Context:                               78 tokens
+Parameters:                            ~45–60M
 
 ```bash
 python train.py
