@@ -181,6 +181,12 @@ python train.py --epochs 1 --lr 3e-4
 --resume: initialize latest checkpoint based on training data fingerprint and offset in train samples stream automatically saved;
 --checkpoint-cadence: number, after how many samples should checkpoint be created
 
+### Loss
+
+Cross entropy with softmax thru legal moves in vocabulary only.  
+Library `python-chess` used to generate legal moves.  
+Only the move contributes (FEN/history get no target).  
+
 ## Inference
 
 Program should interpret game so far, calculate current position and last 5 moves.  
