@@ -43,74 +43,31 @@ args:
 --input: source `.pgn.zst` file
 
 
-Game:
-```
-e4
-e5
-Nf3
-Nc6
-Bb5
-a6
-Ba4
-```
-
-becomes
-
-Input
-```
-<PLAYER_ELO_1800>
-
-rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
-
-<NONE> <NONE> <NONE> <NONE> <NONE>
-```
-
-Output
-
-```
-e4
-```
-
-Input
-
-```
-<PLAYER_ELO_1800>
-
-rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1
-
-<NONE> <NONE> <NONE> <NONE> e4
-```
-
-Output
-
-```
-e5
-```
-
-Input
-```
-<PLAYER_ELO_1800>
-
-rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2
-
-<NONE> <NONE> <NONE> e4 e5
-
-```
-Output
-
-```
-Nf3
-```
-
 Example row in train/eval data:
 
 ```json
-{"elo":1800,"fen":"...","history":["<NONE>","<NONE>","<NONE>","<NONE>","e4"],"move":"e5"}
+{"elo":1800,"position":"rnbqkbnrpppppppp....................P...........PPPP.PPPRNBQKBNR","castling_wk":"<TRUE>","castling_wq":"<TRUE>","castling_bk":"<TRUE>","castling_bq":"<TRUE>","side_to_move":"b","en_passant":"-","halfmove_clock":0,"fullmove_number":1,"history":["<NONE>","<NONE>","<NONE>","<NONE>","e4"],"move":"e5"}
 ```
 
 ### Tokenization
 
-For FEN position use per character tokenization.
+The position is encoded as a fixed-length token sequence of 78 tokens
+(no padding needed) instead of FEN characters:
+
+| Segment | Token values | Count | Values per position |
+|---|---|---|---|
+| elo | `<PLAYER_ELO_0>`…`<PLAYER_ELO_4000>` | 1 | 41 |
+| squares, a8→h1 rank-major | 13 (`K`…`p`, `.`) | 64 | 13 |
+| castling_wk | `<TRUE>`/`<FALSE>` | 1 | 2 |
+| castling_wq | `<TRUE>`/`<FALSE>` | 1 | 2 |
+| castling_bk | `<TRUE>`/`<FALSE>` | 1 | 2 |
+| castling_bq | `<TRUE>`/`<FALSE>` | 1 | 2 |
+| side to move | `w` / `b` | 1 | 2 |
+| en passant | target square or `-` | 1 | 65 |
+| halfmove clock | 0–200 (plies since capture/pawn move) | 1 | 201 |
+| fullmove number | 0–300 (after Black's move) | 1 | 301 |
+| history | SAN tokens, front-`<NONE>` padded | 5 | move vocab + 1 |
+| **Total** | | **78 tokens, always** |
 
 For moves use one token per move.
 
@@ -129,6 +86,8 @@ Special tokens:
 
 ```
 <NONE>
+<TRUE>
+<FALSE>
 <PLAYER_ELO_1200>
 etc.
 ```
