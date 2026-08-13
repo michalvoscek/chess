@@ -110,6 +110,7 @@ FFN Size (4× hidden size):             2048
 Context:                               78 tokens
 Parameters:                            ~45–60M
 Positional encoding:                   learned embeddings (78 × 512 table, trained with the model)
+Normalization                          pre-norm + RMSNorm
 
 ```bash
 python train.py
