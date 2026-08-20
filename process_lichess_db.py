@@ -104,6 +104,19 @@ def padded_history(previous_moves):
     return history
 
 
+def board_position_string(board):
+    chars = []
+    for rank in range(7, -1, -1):
+        for file in range(8):
+            piece = board.piece_at(chess.square(file, rank))
+            chars.append(piece.symbol() if piece else ".")
+    return "".join(chars)
+
+
+def castling_token(value):
+    return "<TRUE>" if value else "<FALSE>"
+
+
 def create_game_samples(game, white_elo, black_elo):
     board = game.board()
     previous_moves = deque(maxlen=HISTORY_SIZE)
@@ -112,9 +125,18 @@ def create_game_samples(game, white_elo, black_elo):
     for move in game.mainline_moves():
         san = board.san(move)
         player_elo = white_elo if board.turn == chess.WHITE else black_elo
+        ep_square = board.ep_square
         sample = {
             "elo": player_elo,
-            "fen": board.fen(),
+            "position": board_position_string(board),
+            "castling_wk": castling_token(board.has_kingside_castling_rights(chess.WHITE)),
+            "castling_wq": castling_token(board.has_queenside_castling_rights(chess.WHITE)),
+            "castling_bk": castling_token(board.has_kingside_castling_rights(chess.BLACK)),
+            "castling_bq": castling_token(board.has_queenside_castling_rights(chess.BLACK)),
+            "side_to_move": "w" if board.turn == chess.WHITE else "b",
+            "en_passant": chess.square_name(ep_square) if ep_square else "-",
+            "halfmove_clock": board.halfmove_clock,
+            "fullmove_number": board.fullmove_number,
             "history": padded_history(previous_moves),
             "move": san,
         }
