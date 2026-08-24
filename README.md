@@ -127,12 +127,6 @@ flags:
 When `data/train.jsonl` is replaced with new games, continue training from
 the old weights instead of random init.
 
-Important: It might be needed to extend move set vocabulary for new moves not seen in previous training data.  
-Store vocab with checkpoint.  
-Keep existing IDs stable.  
-Initialize new weights at random.  
-Build vocab before training from train.jsonl.  
-
 For ELO there should be be predefined tokens from `<PLAYER_ELO_0>` to `<PLAYER_ELO_4000>` incrementing by 100. So extending is not needed here.
 
 For training data fingerprint should be calculated so using sha256 of `train.jsonl`
