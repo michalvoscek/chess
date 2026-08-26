@@ -6,8 +6,8 @@ Use python venv.
 ## Input and output
 
 Application should accept input:
-1. elo of game
-2. current position (in FEN format)
+1. elo of player to move
+2. current position
 3. last 5 moves (in PGN format)
 
 and return output:
@@ -79,6 +79,8 @@ The position is encoded as a fixed-length token sequence of 78 tokens
 | fullmove number | 0–300 (after Black's move) | 1 | 301 |
 | history | SAN tokens, front-`<NONE>` padded | 5 | move vocab + 1 |
 | **Total** | | **78 tokens, always** |
+
+If for some reason tokens miss e.g. games has more that 300 moves skip game in training show error for inference.
 
 For moves use one token per move.
 
