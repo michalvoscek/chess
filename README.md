@@ -111,8 +111,9 @@ Use batches of size 512 moves. Use eval for every checkpoint creation.
 
 AdamW
 
-Weight decay     0.1
-Learning rate    3e-4
+Weight decay        0.1
+Learning rate       3e-4
+Gradient clipping   1
 
 ### Model
 Decoder-only Transformer
@@ -136,7 +137,7 @@ python train.py
 ```
 flags:
 --epochs: n - how many times to go thru training data  
---lr: r - default 0.0003, how much should training affect weights  
+--lr: r - default 0.0003, how much should training affect weights, learning rate should be constant over entire run  
 --device: cpu or gpu:1 what device to use for training  
 
 ### Resuming after data changes
@@ -174,3 +175,8 @@ flags:
 --elo: target elo of the player to move  
 --pgn: game so far in pgn format  
 --model: checkpoint file or prefix (default: latest)  
+
+
+## Possible improvements
+
+Consider warmup for and cosine decay for learning rate.  
