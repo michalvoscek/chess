@@ -16,6 +16,7 @@ Usage:
         SEQ_LEN,
         ModelConfig,
         ChessTransformer,
+        encode_sample,
         legal_move_ids,
         legal_move_loss,
         load_vocab,
@@ -39,13 +40,12 @@ def load_vocab(path):
         return json.load(file)
 
 
-def tokenize_sample(sample, token_to_id):
-    """Map a train/eval sample to (input_ids, target_id), or None."""
+def encode_sample(sample, token_to_id):
+    """Map a train/eval sample to its input token ids, or None."""
     lookup = token_to_id.get
     position = sample["position"]
     history = sample["history"]
-    target = lookup(sample["move"])
-    if target is None or len(position) != 64 or len(history) != 5:
+    if len(position) != 64 or len(history) != 5:
         return None
     values = (
         [f"<PLAYER_ELO_{sample['elo']}>"]
@@ -56,6 +56,17 @@ def tokenize_sample(sample, token_to_id):
     )
     ids = [lookup(value) for value in values]
     if None in ids:
+        return None
+    return ids
+
+
+def tokenize_sample(sample, token_to_id):
+    """Map a train/eval sample to (input_ids, target_id), or None."""
+    target = token_to_id.get(sample["move"])
+    if target is None:
+        return None
+    ids = encode_sample(sample, token_to_id)
+    if ids is None:
         return None
     return ids, target
 
