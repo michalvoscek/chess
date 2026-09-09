@@ -434,8 +434,7 @@ def main():
                             f"loss {mean_loss:.4f}  {rate:,.0f} samples/s  "
                             f"ETA {format_duration(remaining / rate)}"
                         )
-                        sys.stdout.write("\r" + progress.ljust(140))
-                        sys.stdout.flush()
+                        print(progress)
                         last_progress = now
                         loss_sum = 0.0
                         loss_count = 0
@@ -453,7 +452,7 @@ def main():
                         path = save_checkpoint(model, optimizer, state)
                         prune_checkpoints()
                         last_saved_global = done_samples
-                        print(f"\ncheckpoint {path}  eval loss {eval_loss}")
+                        print(f"checkpoint {path}  eval loss {eval_loss}")
 
             if micros_since_step:
                 optimizer_step(model, optimizer)
