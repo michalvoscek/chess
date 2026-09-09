@@ -75,7 +75,7 @@ The position is encoded as a fixed-length token sequence of 78 tokens
 | castling_bq | `<TRUE>`/`<FALSE>` | 1 | 2 |
 | side to move | `w` / `b` | 1 | 2 |
 | en passant | target square or `-` | 1 | 65 |
-| halfmove clock | 0–200 (plies since capture/pawn move) | 1 | 201 |
+| halfmove clock | 0–300 (plies since capture/pawn move) | 1 | 201 |
 | fullmove number | 0–300 (after Black's move) | 1 | 301 |
 | history | SAN tokens, front-`<NONE>` padded | 5 | move vocab + 1 |
 | **Total** | | **78 tokens, always** |
@@ -170,16 +170,23 @@ Only the move contributes (FEN/history get no target).
 ## Inference
 
 Program should interpret game so far, calculate current position and last 5 moves.  
-Then for every legal move it should run thru model to calculate probability of that move.
+Forward pass produces logits from that probablities are calculated using softmax algorithm.
 
 ```bash
 python infer.py --elo 1800 --pgn "1. e4 e5 2. Nf3 *"
 ```
 
 flags:  
---elo: target elo of the player to move  
---pgn: game so far in pgn format  
---model: checkpoint file or prefix (default: latest)  
+--elo: target elo of the player to move rounded to 100.  
+--pgn: game so far in pgn format empty on first move  
+--model: checkpoint file (in `.pt` format), by default latest is used based on `checkpoints/ckpt_*.pt` search  
+--device: `cpu` or `gpu<n>` default is `gpu:0`  
+
+Output is JSON with probabilities:
+
+```json
+[{"move": "e5", "p": 0.418}, {"move": "Nf6", "p": 0.305}]
+```
 
 
 ## Possible improvements
