@@ -45,6 +45,7 @@ DATA_DIR = "data"
 CHECKPOINT_DIR = "checkpoints"
 MICRO_BATCH = 256
 ACCUM_STEPS = 2
+DEFAULT_LR = 3e-4
 WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
 CHUNK_LINES = 2048
@@ -68,7 +69,18 @@ def positive_int(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the chess move model")
     parser.add_argument("--epochs", type=positive_int, default=1, help="passes over the training data (default: 1)")
-    parser.add_argument("--lr", type=float, default=3e-4, help="constant learning rate (default: 3e-4)")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="learning rate (default: 3e-4, or the checkpoint's lr when resuming)",
+    )
+    parser.add_argument(
+        "--wd",
+        type=float,
+        default=None,
+        help="AdamW weight decay on weights and embeddings (default: 0.1, or the checkpoint's wd when resuming)",
+    )
     parser.add_argument("--device", default="gpu:0", help="cpu or gpu:N (default: gpu:0)")
     parser.add_argument("--resume", action="store_true", help="continue from the latest checkpoint in checkpoints/")
     parser.add_argument(
@@ -184,12 +196,12 @@ def _prepare_chunk(chunk):
     return prepared
 
 
-def build_optimizer(model, lr):
+def build_optimizer(model, lr, wd):
     decay = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
     return torch.optim.AdamW(
         [
-            {"params": decay, "weight_decay": WEIGHT_DECAY},
+            {"params": decay, "weight_decay": wd},
             {"params": no_decay, "weight_decay": 0.0},
         ],
         lr=lr,
@@ -323,7 +335,7 @@ def load_checkpoint(path, fingerprint, vocab_fingerprint, config, model, optimiz
     return 0, 0, 0
 
 
-def make_state(fingerprint, vocab_fingerprint, config, epoch, offset, eval_offset, eval_loss, lr, global_samples):
+def make_state(fingerprint, vocab_fingerprint, config, epoch, offset, eval_offset, eval_loss, lr, wd, global_samples):
     return {
         "fingerprint": fingerprint,
         "vocab_fingerprint": vocab_fingerprint,
@@ -333,6 +345,7 @@ def make_state(fingerprint, vocab_fingerprint, config, epoch, offset, eval_offse
         "eval_offset": eval_offset,
         "eval_loss": eval_loss,
         "lr": lr,
+        "wd": wd,
         "global_samples": global_samples,
     }
 
@@ -368,7 +381,9 @@ def main():
 
     model = ChessTransformer(config).to(device)
     print(f"model parameters: {sum(p.numel() for p in model.parameters()):,} on {device}")
-    optimizer = build_optimizer(model, args.lr)
+    lr = args.lr if args.lr is not None else DEFAULT_LR
+    wd = args.wd if args.wd is not None else WEIGHT_DECAY
+    optimizer = build_optimizer(model, lr, wd)
 
     start_epoch, start_offset, eval_offset = 0, 0, 0
     if args.resume:
@@ -378,9 +393,17 @@ def main():
         start_epoch, start_offset, eval_offset = load_checkpoint(
             path, fingerprint, vocab_fingerprint, config, model, optimizer
         )
+        for index, group in enumerate(optimizer.param_groups):
+            if args.lr is not None:
+                group["lr"] = args.lr
+            if args.wd is not None:
+                group["weight_decay"] = args.wd if index == 0 else 0.0
         if start_epoch >= args.epochs:
             print("training already complete")
             return
+    effective_lr = optimizer.param_groups[0]["lr"]
+    effective_wd = optimizer.param_groups[0]["weight_decay"]
+    print(f"optimizer learning rate {effective_lr:.4g}, weight decay {effective_wd:.4g}")
 
     cadence = args.checkpoint_cadence or train_lines
     expected_checkpoints = max(1, math.ceil(args.epochs * train_lines / cadence))
@@ -447,7 +470,7 @@ def main():
                         )
                         state = make_state(
                             fingerprint, vocab_fingerprint, config, epoch, lines_done,
-                            eval_offset, eval_loss, args.lr, done_samples,
+                            eval_offset, eval_loss, effective_lr, effective_wd, done_samples,
                         )
                         path = save_checkpoint(model, optimizer, state)
                         prune_checkpoints()
@@ -461,7 +484,7 @@ def main():
         print("\ninterrupted; saving checkpoint")
         state = make_state(
             fingerprint, vocab_fingerprint, config, epoch, lines_done,
-            eval_offset, None, args.lr, epoch * train_lines + lines_done,
+            eval_offset, None, effective_lr, effective_wd, epoch * train_lines + lines_done,
         )
         if last_saved_global != state["global_samples"]:
             save_checkpoint(model, optimizer, state)
@@ -474,7 +497,7 @@ def main():
         )
         state = make_state(
             fingerprint, vocab_fingerprint, config, args.epochs, 0,
-            eval_offset, eval_loss, args.lr, done_samples,
+            eval_offset, eval_loss, effective_lr, effective_wd, done_samples,
         )
         path = save_checkpoint(model, optimizer, state)
         prune_checkpoints()
