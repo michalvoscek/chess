@@ -160,6 +160,8 @@ python train.py --epochs 1 --lr 3e-4
 
 --resume: initialize latest checkpoint based on training data fingerprint and offset in train samples stream automatically saved;
 --checkpoint-cadence: number, after how many samples should checkpoint be created
+--lr: learning rate to use, default 0.0003
+--wd: AdamW weight decay on weights, default 0.1 (lower value should make loss decrease faster)
 
 ### Loss
 
