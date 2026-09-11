@@ -1,0 +1,10 @@
+{
+  "name": "chess3",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix gui",
+    "build": "npm run build --prefix gui",
+    "start": "npm run start --prefix gui",
+    "lint": "npm run lint --prefix gui"
+  }
+}
