@@ -184,11 +184,10 @@ flags:
 --model: checkpoint file (in `.pt` format), by default latest is used based on `checkpoints/ckpt_*.pt` search  
 --device: `cpu` or `gpu<n>` default is `gpu:0`  
 
-Output is move and its probability sorted from highest:
+Output is JSON with probabilities:
 
-```
-e5 0.418
-Nf6 0.305
+```json
+[{"move": "e5", "p": 0.418}, {"move": "Nf6", "p": 0.305}]
 ```
 
 
