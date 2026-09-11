@@ -239,10 +239,10 @@ export default function Home() {
         <div className="min-h-24 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 p-3 text-sm leading-7 text-zinc-100">
           {history.length === 0 && <span className="text-zinc-500">no moves yet</span>}
           {Array.from({ length: Math.ceil(history.length / 2) }, (_, i) => (
-            <span key={i} className="mr-3 whitespace-nowrap">
+            <div key={i} className="mr-3 whitespace-nowrap">
               <span className="text-zinc-500">{i + 1}.</span> {history[i * 2]}{" "}
               {history[i * 2 + 1] ?? ""}
-            </span>
+            </div>
           ))}
         </div>
       </div>
