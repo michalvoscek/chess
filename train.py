@@ -87,10 +87,11 @@ def parse_args(argv=None):
         "--checkpoint-cadence",
         dest="checkpoint_cadence",
         type=positive_int,
-        help="create a checkpoint every N training samples (default: once per epoch)",
+        default=100000,
+        help="create a checkpoint every N training samples (default: 100000)",
     )
     args = parser.parse_args(argv)
-    if args.checkpoint_cadence and args.checkpoint_cadence < MICRO_BATCH * ACCUM_STEPS:
+    if args.checkpoint_cadence < MICRO_BATCH * ACCUM_STEPS:
         parser.error(f"--checkpoint-cadence must be at least {MICRO_BATCH * ACCUM_STEPS}")
     return args
 
@@ -405,7 +406,7 @@ def main():
     effective_wd = optimizer.param_groups[0]["weight_decay"]
     print(f"optimizer learning rate {effective_lr:.4g}, weight decay {effective_wd:.4g}")
 
-    cadence = args.checkpoint_cadence or train_lines
+    cadence = args.checkpoint_cadence
     expected_checkpoints = max(1, math.ceil(args.epochs * train_lines / cadence))
     eval_slice_size = max(1, math.ceil(eval_lines / expected_checkpoints)) if eval_lines else 0
     next_trigger = ((start_offset // cadence) + 1) * cadence
