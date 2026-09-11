@@ -4,7 +4,7 @@
 Parses the game so far from PGN movetext, rebuilds the current position and
 the last five moves, tokenizes them the same way as training data and runs
 one forward pass.  The logits are turned into probabilities with softmax
-over legal moves only and printed as a JSON array sorted by probability
+over legal moves only and printed one move per line, sorted by probability
 descending.
 
 Usage:
@@ -15,7 +15,6 @@ Usage:
 import argparse
 import glob
 import io
-import json
 import os
 import sys
 
@@ -124,11 +123,8 @@ def main():
             logits = model(tokens)[0]
     probs = torch.softmax(logits[legal_ids].float(), dim=0)
 
-    moves = [
-        {"move": san, "p": prob}
-        for san, prob in sorted(zip(legal_sans, probs.tolist()), key=lambda pair: pair[1], reverse=True)
-    ]
-    print(json.dumps(moves))
+    for san, prob in sorted(zip(legal_sans, probs.tolist()), key=lambda pair: pair[1], reverse=True):
+        print(f"{san} {prob:.3f}")
 
 
 if __name__ == "__main__":
