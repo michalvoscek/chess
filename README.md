@@ -195,3 +195,18 @@ Nf6 0.305
 ## Possible improvements
 
 Consider warmup for and cosine decay for learning rate.  
+
+
+## GUI
+
+Simple GUI written in react using chessground.js library to visualize and input position and moves.  
+Should have one screen at start containing:
+1. standard chess board in opening position
+2. input for elo (allow any number but should be rounded to closest available token for expressing elo), elo can change during game
+3. button that plays next move (no matter what color has turn computer can play both both sides), move played should be based on probablity it recieves from inference of the model
+4. buttons to restart game and undo last move
+5. list of moves played in pgn format
+
+Board shouls allow user to make only legal moves.  
+Promotions should be handled by picker dialog.  
+Inference should be used by spawning new process for `infer.py` script.  
