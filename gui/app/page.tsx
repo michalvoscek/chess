@@ -69,9 +69,12 @@ export default function Home() {
   const apiRef = useRef<Api | null>(null);
   const applyStateRef = useRef<() => void>(() => {});
   const userMoveRef = useRef<(orig: Key, dest: Key) => void>(() => {});
+  const playNextRef = useRef<() => void>(() => {});
+  const attemptedFenRef = useRef<string | null>(null);
 
   const [fen, setFen] = useState(game.fen());
   const [eloInput, setEloInput] = useState("1500");
+  const [autoplay, setAutoplay] = useState<"none" | "white" | "black">("none");
   const [thinking, setThinking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [promotion, setPromotion] = useState<PendingPromotion | null>(null);
@@ -89,6 +92,7 @@ export default function Home() {
       return;
     }
     setError(null);
+    attemptedFenRef.current = null;
     setFen(game.fen());
   }
 
@@ -107,6 +111,7 @@ export default function Home() {
 
   useEffect(() => {
     userMoveRef.current = handleUserMove;
+    playNextRef.current = playNext;
     applyStateRef.current = () => {
       const last = game.history({ verbose: true }).at(-1);
       apiRef.current?.set({
@@ -116,7 +121,12 @@ export default function Home() {
         lastMove: last ? [last.from, last.to] : undefined,
         movable: {
           free: false,
-          color: "both",
+          color:
+            autoplay === "none"
+              ? "both"
+              : autoplay === "white"
+                ? "black"
+                : "white",
           showDests: true,
           dests: thinking || promotion || gameOver ? undefined : dests,
           events: {
@@ -130,6 +140,14 @@ export default function Home() {
   useEffect(() => {
     applyStateRef.current();
   }, [fen, thinking, promotion, gameOver, dests]);
+
+  useEffect(() => {
+    if (autoplay === "none" || thinking || gameOver) return;
+    if (game.turn() !== (autoplay === "white" ? "w" : "b")) return;
+    if (attemptedFenRef.current === game.fen()) return;
+    attemptedFenRef.current = game.fen();
+    playNextRef.current();
+  }, [autoplay, game, fen, thinking, gameOver]);
 
   useEffect(() => {
     let disposed = false;
@@ -185,6 +203,7 @@ export default function Home() {
     game.undo();
     setPromotion(null);
     setError(null);
+    attemptedFenRef.current = null;
     setFen(game.fen());
   }
 
@@ -194,6 +213,7 @@ export default function Home() {
     setGame(fresh);
     setPromotion(null);
     setError(null);
+    attemptedFenRef.current = null;
     setFen(fresh.fen());
   }
 
@@ -206,6 +226,24 @@ export default function Home() {
         <div ref={boardRef} className="aspect-square w-full" />
       </div>
       <div className="flex w-full max-w-[480px] flex-col gap-4 lg:w-72 lg:max-w-none">
+        <div className="flex flex-col gap-1">
+          <label htmlFor="autoplay" className="text-sm font-medium text-zinc-400">
+            autoplay
+          </label>
+          <select
+            id="autoplay"
+            value={autoplay}
+            onChange={(event) => {
+              setAutoplay(event.target.value as "none" | "white" | "black");
+              attemptedFenRef.current = null;
+            }}
+            className="rounded-lg border border-zinc-600 bg-zinc-900 px-3 py-2 text-lg text-zinc-100 outline-none focus:border-zinc-400"
+          >
+            <option value="none">no autoplay</option>
+            <option value="white">autoplay white</option>
+            <option value="black">autoplay black</option>
+          </select>
+        </div>
         <div className="flex flex-col gap-1">
           <label htmlFor="elo" className="text-sm font-medium text-zinc-400">
             elo (side to move)
