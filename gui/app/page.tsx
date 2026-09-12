@@ -198,7 +198,7 @@ export default function Home() {
   }
 
   const buttonClass =
-    "cursor-pointer rounded-lg border border-zinc-600 bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40";
+    "cursor-pointer flex-auto rounded-lg border border-zinc-600 bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40";
 
   return (
     <main className="flex w-full flex-1 flex-col items-center justify-center gap-8 p-6 lg:flex-row lg:items-start lg:justify-center">
@@ -224,19 +224,21 @@ export default function Home() {
             <span className="text-xs text-zinc-500">applied as {appliedElo}</span>
           )}
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-col gap-2">
           <button onClick={playNext} disabled={thinking || gameOver} className={buttonClass}>
             {thinking ? "thinking…" : "play next move"}
           </button>
-          <button onClick={undo} disabled={thinking || !history.length} className={buttonClass}>
-            undo
-          </button>
-          <button onClick={restart} disabled={thinking} className={buttonClass}>
-            restart
-          </button>
+          <div className="w-full flex flex-row gap-2">
+            <button onClick={undo} disabled={thinking || !history.length} className={buttonClass}>
+              undo
+            </button>
+            <button onClick={restart} disabled={thinking} className={buttonClass}>
+              restart
+            </button>
+          </div>
         </div>
         {error && <p className="text-sm text-red-400">{error}</p>}
-        <div className="min-h-24 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 p-3 text-sm leading-7 text-zinc-100">
+        <div className="flex-1 rounded-lg border border-zinc-700  p-3 text-sm leading-7 text-zinc-900 min-h-96 overflow-scroll">
           {history.length === 0 && <span className="text-zinc-500">no moves yet</span>}
           {Array.from({ length: Math.ceil(history.length / 2) }, (_, i) => (
             <div key={i} className="mr-3 whitespace-nowrap">
