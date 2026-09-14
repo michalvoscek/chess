@@ -276,7 +276,7 @@ export default function Home() {
           </div>
         </div>
         {error && <p className="text-sm text-red-400">{error}</p>}
-        <div className="flex-1 rounded-lg border border-zinc-700  p-3 text-sm leading-7 text-zinc-900 min-h-96 overflow-scroll">
+        <div className="h-96 rounded-lg border border-zinc-700  p-3 text-sm leading-7 text-zinc-900 overflow-auto">
           {history.length === 0 && <span className="text-zinc-500">no moves yet</span>}
           {Array.from({ length: Math.ceil(history.length / 2) }, (_, i) => (
             <div key={i} className="mr-3 whitespace-nowrap">
