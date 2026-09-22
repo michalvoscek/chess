@@ -1,46 +1,97 @@
 #!/usr/bin/env python3
-"""Convert between chess positions and the sample fields used in train/eval data.
+"""Convert between chess positions and the compact training record fields.
 
-Training data stores each position as flat fields instead of FEN.  This
-module converts in both directions:
+Each train/eval sample stores one position as:
 
-* board -> sample fields, used when generating train/eval data
-  (process_lichess_db.py)
-* sample fields -> board, used for legal move masking during training
-  and for inference
+    squares[64]  uint8   0 empty, 1-6 white PNBRQK, 7-12 black pnbrqk (a1=0 .. h8=63)
+    stm          uint8   0 white, 1 black
+    castling     uint8   bit0 wk, bit1 wq, bit2 bk, bit3 bq
+    ep           uint8   0 none, 1-64 = en passant target square index + 1
 
-It never maps to or from token ids; vocabulary lookup belongs to the
-scripts that consume the samples.
+and, alongside the position fields:
+
+    elo          uint8   Elo bracket / 100 (0..40)
+    target       uint16  UCI move id (see move_vocab.py)
+    history[5]   uint16  previous UCI move ids, front-padded with <NONE>
 
 Usage:
-    from fen_codec import board_to_sample, sample_to_fen, sample_to_board
+    from fen_codec import board_to_fields, fields_to_board, uci_to_san
 """
 
 import chess
+import numpy as np
+
+N_PIECE = 13
+N_STM = 2
+N_CASTLING = 16
+N_EP = 65
+N_ELO = 41
+MAX_ELO = 4000
+HISTORY_SIZE = 5
+RECORD_FIELDS = ("squares", "elo", "stm", "castling", "ep", "target", "history")
+RECORD_DTYPE = np.dtype(
+    [
+        ("squares", np.uint8, (64,)),
+        ("elo", np.uint8),
+        ("stm", np.uint8),
+        ("castling", np.uint8),
+        ("ep", np.uint8),
+        ("target", np.uint16),
+        ("history", np.uint16, (HISTORY_SIZE,)),
+    ],
+    align=False,
+)
+assert RECORD_DTYPE.itemsize == 80, RECORD_DTYPE.itemsize
+SYMBOLS = ".PNBRQKpnbrqk"
+CASTLING_BITS = (
+    (chess.BB_H1, 1),
+    (chess.BB_A1, 2),
+    (chess.BB_H8, 4),
+    (chess.BB_A8, 8),
+)
 
 
-def board_to_sample(board):
-    """Convert a board to the position-related fields of a train/eval sample."""
-    position = []
-    for rank in range(7, -1, -1):
-        for file in range(8):
-            piece = board.piece_at(chess.square(file, rank))
-            position.append(piece.symbol() if piece else ".")
-    castling = {
-        "castling_wk": "<TRUE>" if board.has_kingside_castling_rights(chess.WHITE) else "<FALSE>",
-        "castling_wq": "<TRUE>" if board.has_queenside_castling_rights(chess.WHITE) else "<FALSE>",
-        "castling_bk": "<TRUE>" if board.has_kingside_castling_rights(chess.BLACK) else "<FALSE>",
-        "castling_bq": "<TRUE>" if board.has_queenside_castling_rights(chess.BLACK) else "<FALSE>",
-    }
+def piece_code(piece):
+    if piece is None:
+        return 0
+    return piece.piece_type if piece.color == chess.WHITE else piece.piece_type + 6
+
+
+def code_symbol(code):
+    return SYMBOLS[code]
+
+
+def elo_bracket(elo):
+    """Round a non-negative integer Elo to the nearest 100, half up."""
+    return 100 * ((elo + 50) // 100)
+
+
+def elo_index(value):
+    """Map an Elo value or bracket to its embedding index 0..40, or None."""
+    if value is None:
+        return None
+    try:
+        elo = int(value)
+    except (TypeError, ValueError):
+        return None
+    if elo < 0:
+        return None
+    bracket = elo_bracket(elo)
+    if bracket > MAX_ELO:
+        return None
+    return bracket // 100
+
+
+def board_to_fields(board):
+    """Position fields of a record (squares, stm, castling, ep)."""
+    squares = [piece_code(board.piece_at(square)) for square in range(64)]
+    castling = 0
+    for mask, bit in CASTLING_BITS:
+        if board.castling_rights & mask:
+            castling |= bit
     ep_square = board.ep_square
-    return {
-        "position": "".join(position),
-        **castling,
-        "side_to_move": "w" if board.turn == chess.WHITE else "b",
-        "en_passant": chess.square_name(ep_square) if ep_square else "-",
-        "halfmove_clock": board.halfmove_clock,
-        "fullmove_number": board.fullmove_number,
-    }
+    ep = 0 if ep_square is None else ep_square + 1
+    return squares, (0 if board.turn == chess.WHITE else 1), castling, ep
 
 
 def _compress_row(row):
@@ -59,35 +110,26 @@ def _compress_row(row):
     return "".join(parts)
 
 
-def sample_to_fen(sample):
-    """Rebuild the FEN string of the position stored in a sample."""
-    rows = [sample["position"][i * 8 : (i + 1) * 8] for i in range(8)]
-    placement = "/".join(_compress_row(row) for row in rows)
-    castling = ""
-    for flag, letter in (
-        ("castling_wk", "K"),
-        ("castling_wq", "Q"),
-        ("castling_bk", "k"),
-        ("castling_bq", "q"),
-    ):
-        if sample[flag] == "<TRUE>":
-            castling += letter
-    castling = castling or "-"
-    return " ".join(
-        (
-            placement,
-            sample["side_to_move"],
-            castling,
-            sample["en_passant"],
-            str(sample["halfmove_clock"]),
-            str(sample["fullmove_number"]),
-        )
-    )
+def fields_to_fen(squares, stm, castling, ep):
+    """Rebuild the FEN string stored in record position fields."""
+    rows = []
+    for rank in range(7, -1, -1):
+        rows.append(_compress_row("".join(code_symbol(squares[rank * 8 + file]) for file in range(8))))
+    castling_flags = ""
+    for letter, bit in (("K", 1), ("Q", 2), ("k", 4), ("q", 8)):
+        if castling & bit:
+            castling_flags += letter
+    ep_name = "-" if ep == 0 else chess.square_name(ep - 1)
+    return " ".join(("/".join(rows), "w" if stm == 0 else "b", castling_flags or "-", ep_name, "0", "1"))
 
 
-def sample_to_board(sample):
-    """Rebuild the board stored in a sample."""
-    return chess.Board(sample_to_fen(sample))
+def fields_to_board(squares, stm, castling, ep):
+    """Rebuild the board stored in record position fields."""
+    return chess.Board(fields_to_fen(squares, stm, castling, ep))
+
+
+def uci_to_san(board, uci):
+    return board.san(chess.Move.from_uci(uci))
 
 
 def _self_test():
@@ -97,43 +139,30 @@ def _self_test():
         chess.Board("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq e6 0 3"),
         chess.Board("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 1 1"),
         chess.Board("8/8/8/8/8/8/8/K6k w - - 37 92"),
+        chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"),
     ]
     ep_board = chess.Board()
     ep_board.push_san("e4")
     positions.append(ep_board)
-    sample_fields = {
-        "position",
-        "castling_wk",
-        "castling_wq",
-        "castling_bk",
-        "castling_bq",
-        "side_to_move",
-        "en_passant",
-        "halfmove_clock",
-        "fullmove_number",
-    }
+    a3_board = chess.Board()
+    a3_board.push_san("a4")
+    positions.append(a3_board)
     for board in positions:
-        sample = board_to_sample(board)
-        assert set(sample) == sample_fields
-        rebuilt = sample_to_board(sample)
-        assert rebuilt.fen() == board.fen(), (board.fen(), rebuilt.fen())
+        squares, stm, castling, ep = board_to_fields(board)
+        assert len(squares) == 64
+        assert 0 <= stm < N_STM and 0 <= castling < N_CASTLING and 0 <= ep < N_EP
+        rebuilt = fields_to_board(squares, stm, castling, ep)
+        assert rebuilt.piece_map() == board.piece_map(), (board.fen(), rebuilt.fen())
+        assert rebuilt.turn == board.turn
+        assert rebuilt.castling_rights == board.castling_rights, (board.fen(), rebuilt.fen())
+    assert elo_index(1500) == 15
+    assert elo_index(1540) == 15
+    assert elo_index(1550) == 16
+    assert elo_index(4049) == 40
+    assert elo_index(4050) is None
+    assert elo_index("nope") is None
     print(f"self test passed for {len(positions)} positions")
 
 
 if __name__ == "__main__":
     _self_test()
-
-# Training data properties produced by this module:
-#
-#     position            yes (from board)
-#     castling_wk         yes (from board)
-#     castling_wq         yes (from board)
-#     castling_bk         yes (from board)
-#     castling_bq         yes (from board)
-#     side_to_move        yes (from board)
-#     en_passant          yes (from board)
-#     halfmove_clock      yes (from board)
-#     fullmove_number     yes (from board)
-#     elo                 no  (from game headers, player to move)
-#     history             no  (from previous moves of the game)
-#     move                no  (target move of the sample, from the game)

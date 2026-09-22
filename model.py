@@ -1,100 +1,64 @@
 #!/usr/bin/env python3
-"""Chess move prediction model: sample tokenization and the transformer.
+"""Chess move prediction model: record batching and the transformer.
 
-Tokenization turns a train/eval sample into the fixed 78-token id sequence
-described in README.md plus the target move token id.  The model is a
-transformer over that sequence with bidirectional attention: the whole
-position is observed at once, so there is no causal mask.  The final
-hidden states are mean pooled and projected through the tied token
-embedding to produce logits.
+The transformer reads a 74-token sequence: Elo, 64 square tokens (piece
+embedding plus learned square embedding), side to move, castling,
+en passant, five history moves, and a learned <QUERY> token.  Attention
+is bidirectional (the whole position is observed at once).  The QUERY
+hidden state is projected through the tied move embedding to produce
+logits over the 1,968 UCI moves plus the <NONE> history pad.
 
-Samples whose values have no token (out-of-range clocks or move numbers,
-unknown moves) tokenize to None and are skipped by callers, per README.
+Input and output share only the move embedding (a history "e2e4" and the
+output "e2e4" are the same concept).  State fields get their own small
+tables so tokens cannot collide.
 
 Usage:
     from model import (
         SEQ_LEN,
         ModelConfig,
         ChessTransformer,
-        encode_sample,
-        legal_move_ids,
         legal_move_loss,
-        load_vocab,
-        tokenize_sample,
+        make_batch,
     )
 """
 
-import json
-
+import numpy as np
 import torch
 from torch import nn
 
-from fen_codec import sample_to_board
+from fen_codec import (
+    HISTORY_SIZE,
+    N_CASTLING,
+    N_ELO,
+    N_EP,
+    N_PIECE,
+    N_STM,
+    RECORD_DTYPE,
+)
+from move_vocab import MOVE_VOCAB_SIZE
 
-SEQ_LEN = 78
-
-
-def load_vocab(path):
-    """Load vocab.json and return the document with tokens and token_to_id."""
-    with open(path, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def encode_sample(sample, token_to_id):
-    """Map a train/eval sample to its input token ids, or None."""
-    lookup = token_to_id.get
-    position = sample["position"]
-    history = sample["history"]
-    if len(position) != 64 or len(history) != 5:
-        return None
-    values = (
-        [f"<PLAYER_ELO_{sample['elo']}>"]
-        + list(position)
-        + [sample["castling_wk"], sample["castling_wq"], sample["castling_bk"], sample["castling_bq"]]
-        + [sample["side_to_move"], sample["en_passant"], str(sample["halfmove_clock"]), str(sample["fullmove_number"])]
-        + list(history)
-    )
-    ids = [lookup(value) for value in values]
-    if None in ids:
-        return None
-    return ids
-
-
-def tokenize_sample(sample, token_to_id):
-    """Map a train/eval sample to (input_ids, target_id), or None."""
-    target = token_to_id.get(sample["move"])
-    if target is None:
-        return None
-    ids = encode_sample(sample, token_to_id)
-    if ids is None:
-        return None
-    return ids, target
-
-
-def legal_move_ids(sample, token_to_id):
-    """Token ids of every legal move in the sample's position."""
-    board = sample_to_board(sample)
-    return [token_to_id[board.san(move)] for move in board.legal_moves]
+SEQ_LEN = 74
+N_SQUARE = 64
 
 
 class ModelConfig:
     def __init__(
         self,
-        vocab_size,
-        seq_len=SEQ_LEN,
         dim=512,
-        layers=12,
+        layers=8,
         heads=8,
         ffn=2048,
         dropout=0.1,
+        seq_len=SEQ_LEN,
+        vocab_size=MOVE_VOCAB_SIZE,
     ):
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
         self.dim = dim
         self.layers = layers
         self.heads = heads
         self.ffn = ffn
         self.dropout = dropout
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
 
     def as_dict(self):
         return vars(self).copy()
@@ -104,6 +68,21 @@ class ModelConfig:
         return cls(**data)
 
 
+def make_batch(records, device):
+    """Turn a RECORD_DTYPE array into the tensor dict ChessTransformer expects."""
+    if not isinstance(records, np.ndarray):
+        records = np.array(records, dtype=RECORD_DTYPE)
+    return {
+        "squares": torch.as_tensor(records["squares"], dtype=torch.long, device=device),
+        "elo": torch.as_tensor(records["elo"], dtype=torch.long, device=device),
+        "stm": torch.as_tensor(records["stm"], dtype=torch.long, device=device),
+        "castling": torch.as_tensor(records["castling"], dtype=torch.long, device=device),
+        "ep": torch.as_tensor(records["ep"], dtype=torch.long, device=device),
+        "history": torch.as_tensor(records["history"], dtype=torch.long, device=device),
+        "targets": torch.as_tensor(records["target"], dtype=torch.long, device=device),
+    }
+
+
 def _init_weights(module):
     if isinstance(module, nn.Linear):
         nn.init.normal_(module.weight, std=0.02)
@@ -111,10 +90,6 @@ def _init_weights(module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, std=0.02)
-    elif isinstance(module, nn.MultiheadAttention):
-        nn.init.normal_(module.in_proj_weight, std=0.02)
-        if module.in_proj_bias is not None:
-            nn.init.zeros_(module.in_proj_bias)
 
 
 class Block(nn.Module):
@@ -144,21 +119,41 @@ class ChessTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.token_embedding = nn.Embedding(config.vocab_size, config.dim)
-        self.position_embedding = nn.Embedding(config.seq_len, config.dim)
+        dim = config.dim
+        self.elo_emb = nn.Embedding(N_ELO, dim)
+        self.piece_emb = nn.Embedding(N_PIECE, dim)
+        self.square_emb = nn.Embedding(N_SQUARE, dim)
+        self.stm_emb = nn.Embedding(N_STM, dim)
+        self.castling_emb = nn.Embedding(N_CASTLING, dim)
+        self.ep_emb = nn.Embedding(N_EP, dim)
+        self.move_emb = nn.Embedding(config.vocab_size, dim)
+        self.query = nn.Parameter(torch.empty(dim))
+        self.pos_emb = nn.Embedding(config.seq_len, dim)
         self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(Block(config) for _ in range(config.layers))
-        self.norm = nn.RMSNorm(config.dim)
+        self.norm = nn.RMSNorm(dim)
         self.apply(_init_weights)
+        nn.init.normal_(self.query, std=0.02)
 
-    def forward(self, tokens):
-        positions = torch.arange(tokens.size(1), device=tokens.device)
-        x = self.token_embedding(tokens) + self.position_embedding(positions)
-        x = self.dropout(x)
+    def forward(self, batch):
+        batch_size = batch["squares"].size(0)
+        squares = self.piece_emb(batch["squares"]) + self.square_emb.weight.unsqueeze(0)
+        x = torch.cat(
+            [
+                self.elo_emb(batch["elo"]).unsqueeze(1),
+                squares,
+                self.stm_emb(batch["stm"]).unsqueeze(1),
+                self.castling_emb(batch["castling"]).unsqueeze(1),
+                self.ep_emb(batch["ep"]).unsqueeze(1),
+                self.move_emb(batch["history"]),
+                self.query.view(1, 1, -1).expand(batch_size, 1, -1),
+            ],
+            dim=1,
+        )
+        x = self.dropout(x + self.pos_emb.weight.unsqueeze(0))
         for block in self.blocks:
             x = block(x)
-        pooled = self.norm(x).mean(dim=1)
-        return pooled @ self.token_embedding.weight.T
+        return self.norm(x[:, -1]) @ self.move_emb.weight.T
 
 
 def legal_move_loss(logits, legal_ids, target_ids):
@@ -182,30 +177,26 @@ def legal_move_loss(logits, legal_ids, target_ids):
 
 
 def _self_test():
-    vocab = load_vocab("vocab.json")
-    token_to_id = vocab["token_to_id"]
-    with open("data/train.jsonl", "r", encoding="utf-8") as file:
-        sample = json.loads(file.readline())
-    tokenized = tokenize_sample(sample, token_to_id)
-    assert tokenized is not None, "first train sample failed to tokenize"
-    ids, target = tokenized
-    assert len(ids) == SEQ_LEN
-    legal = legal_move_ids(sample, token_to_id)
-    assert target in legal, "played move not among legal moves"
-
-    config = ModelConfig(
-        vocab_size=vocab["total_tokens"], dim=64, layers=2, heads=4, ffn=128, dropout=0.0
-    )
+    config = ModelConfig(dim=64, layers=2, heads=4, ffn=128, dropout=0.0)
     model = ChessTransformer(config)
-    logits = model(torch.tensor([ids, ids]))
-    assert logits.shape == (2, vocab["total_tokens"])
-    loss = legal_move_loss(logits, [legal, legal], torch.tensor([target, target]))
+    batch_size = 3
+    records = np.zeros(batch_size, dtype=RECORD_DTYPE)
+    records["elo"] = [0, 15, 40]
+    records["target"] = [0, 1, 2]
+    records["history"] = MOVE_VOCAB_SIZE - 1
+    batch = make_batch(records, torch.device("cpu"))
+    logits = model(batch)
+    assert logits.shape == (batch_size, MOVE_VOCAB_SIZE)
+
+    legal = [[0, 1, 2], [3, 4], list(range(10))]
+    targets = torch.tensor([0, 3, 5])
+    loss = legal_move_loss(logits, legal, targets)
     loss.backward()
     assert torch.isfinite(loss)
 
-    with torch.device("meta"):
-        full = ChessTransformer(ModelConfig(vocab_size=vocab["total_tokens"]))
+    full = ChessTransformer(ModelConfig())
     params = sum(p.numel() for p in full.parameters())
+    assert SEQ_LEN == 1 + N_SQUARE + 1 + 1 + 1 + HISTORY_SIZE + 1
     print(f"self test passed; full model parameters: {params:,}")
 
 
