@@ -2,10 +2,9 @@
 """Predict move probabilities for a position with a trained checkpoint.
 
 Parses the game so far from PGN movetext, rebuilds the current position and
-the last five moves, tokenizes them the same way as training data and runs
-one forward pass.  The logits are turned into probabilities with softmax
-over legal moves only and printed as a JSON array sorted by probability
-descending.
+the last five moves, runs one forward pass and turns the logits into
+probabilities with softmax over legal moves only.  Moves are printed in SAN
+(sorted by probability descending) so callers can keep using SAN.
 
 Usage:
     python infer.py --elo 1800 --pgn "1. e4 e5 2. Nf3 *"
@@ -21,20 +20,13 @@ import sys
 
 import chess
 import chess.pgn
+import numpy as np
 import torch
 
-from fen_codec import board_to_sample
-from model import (
-    ChessTransformer,
-    ModelConfig,
-    encode_sample,
-    legal_move_ids,
-    load_vocab,
-)
-from process_lichess_db import HISTORY_SIZE, MAX_ELO_TOKEN, parse_elo, padded_history
+from fen_codec import HISTORY_SIZE, RECORD_DTYPE, board_to_fields, elo_index, uci_to_san
+from move_vocab import NONE_MOVE, move_id_of_uci
+from model import ChessTransformer, ModelConfig, make_batch
 from train import CHECKPOINT_DIR, latest_checkpoint_path, resolve_device
-
-VOCAB_PATH = "vocab.json"
 
 
 def parse_args(argv=None):
@@ -43,11 +35,17 @@ def parse_args(argv=None):
     parser.add_argument("--pgn", default="", help="game so far in PGN movetext format (default: start position)")
     parser.add_argument("--model", help="checkpoint file or filename fragment in checkpoints/ (default: latest)")
     parser.add_argument("--device", default="gpu:0", help="cpu or gpu:N (default: gpu:0)")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="softmax temperature (default: 1.0; higher plays more loosely)",
+    )
     return parser.parse_args(argv)
 
 
 def parse_game(pgn_text):
-    """Parse PGN movetext into (final board, canonical SAN move list)."""
+    """Parse PGN movetext into (final board, UCI id history)."""
     game = chess.pgn.read_game(io.StringIO(pgn_text))
     if game is None:
         if pgn_text.strip():
@@ -58,7 +56,7 @@ def parse_game(pgn_text):
     board = game.board()
     history = []
     for move in game.mainline_moves():
-        history.append(board.san(move))
+        history.append(move)
         board.push(move)
     return board, history
 
@@ -77,52 +75,53 @@ def resolve_checkpoint_path(value):
     sys.exit(f"error: no checkpoint file or prefix match: {value}")
 
 
-def load_model(path, vocab_fingerprint, device):
+def load_model(path, device):
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    state = payload["state"]
-    if state["vocab_fingerprint"] != vocab_fingerprint:
-        sys.exit("error: vocab.json changed since the checkpoint was written")
-    model = ChessTransformer(ModelConfig.from_dict(state["config"]))
+    model = ChessTransformer(ModelConfig.from_dict(payload["state"]["config"]))
     model.load_state_dict(payload["model"])
     model.to(device)
     model.eval()
     return model
 
 
+def build_record(board, elo, history_moves):
+    squares, stm, castling, ep = board_to_fields(board)
+    tail = history_moves[-HISTORY_SIZE:]
+    history_ids = [NONE_MOVE] * (HISTORY_SIZE - len(tail)) + [
+        move_id_of_uci(move.uci()) for move in tail
+    ]
+    record = np.zeros(1, dtype=RECORD_DTYPE)
+    record["squares"][0] = squares
+    record["elo"][0] = elo
+    record["stm"][0] = stm
+    record["castling"][0] = castling
+    record["ep"][0] = ep
+    record["history"][0] = history_ids
+    return record
+
+
 def main():
     args = parse_args()
+    if args.temperature <= 0:
+        sys.exit("error: --temperature must be positive")
     device = resolve_device(args.device)
 
-    vocab = load_vocab(VOCAB_PATH)
-    token_to_id = vocab["token_to_id"]
-
-    elo = parse_elo(args.elo)
+    elo = elo_index(args.elo)
     if elo is None:
-        sys.exit(f"error: invalid elo, expected integer in 0..{MAX_ELO_TOKEN}: {args.elo}")
+        sys.exit(f"error: invalid elo, expected integer in 0..4000: {args.elo}")
 
-    board, history = parse_game(args.pgn)
+    board, history_moves = parse_game(args.pgn)
+    record = build_record(board, elo, history_moves)
+    legal_sans = [uci_to_san(board, move.uci()) for move in board.legal_moves]
+    legal_ids = [move_id_of_uci(move.uci()) for move in board.legal_moves]
 
-    sample = board_to_sample(board)
-    sample["elo"] = elo
-    sample["history"] = padded_history(history[-HISTORY_SIZE:])
+    model = load_model(resolve_checkpoint_path(args.model), device)
 
-    ids = encode_sample(sample, token_to_id)
-    if ids is None:
-        sys.exit("error: position cannot be tokenized (out-of-range clock or move number)")
-
-    try:
-        legal_ids = legal_move_ids(sample, token_to_id)
-    except KeyError as error:
-        sys.exit(f"error: no vocabulary token for legal move {error.args[0]}")
-    legal_sans = [board.san(move) for move in board.legal_moves]
-
-    model = load_model(resolve_checkpoint_path(args.model), vocab["fingerprint"], device)
-
-    tokens = torch.tensor([ids], dtype=torch.long, device=device)
+    batch = make_batch(record, device)
     with torch.no_grad():
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = model(tokens)[0]
-    probs = torch.softmax(logits[legal_ids].float(), dim=0)
+            logits = model(batch)[0]
+    probs = torch.softmax(logits[legal_ids].float() / args.temperature, dim=0)
 
     moves = [
         {"move": san, "p": prob}

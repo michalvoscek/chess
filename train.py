@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Train the chess move model on per-move train/eval jsonl data.
+"""Train the chess move model on per-move binary train/eval shards.
 
-Streams data/train.jsonl sequentially (no shuffling) in micro-batches of 256
-with gradient accumulation 2 for an effective batch of 512, using AdamW with
-weight decay 0.1 on weights and embeddings only, a constant learning rate and
-gradient clipping at 1.  Every --checkpoint-cadence samples the model is
-evaluated on the next proportional slice of data/eval.jsonl (cross entropy
-over legal moves) and a checkpoint is written to checkpoints/ containing the
-optimizer state and the exact stream position, so training can be resumed
-with --resume.  If the training data changed since the checkpoint (different
-sha256 fingerprint) the weights are kept but the stream position is reset.
+Reads data/train.bin (see fen_codec.py) together with its precomputed
+legal-move CSR arrays, shuffles the sample order every epoch and trains
+with AdamW: constant weight decay on weights and embeddings, linear
+learning-rate warmup followed by cosine decay, gradient clipping at 1
+and bf16 autocast on CUDA.  Every --checkpoint-cadence samples the model
+is evaluated on a fixed slice of data/eval.bin and a checkpoint is
+written to checkpoints/ containing the optimizer state and the exact
+epoch/shuffle position so training can be resumed with --resume.  If the
+training data changed since the checkpoint (different meta.json
+fingerprint) the weights are kept but the stream position is reset.
 
 Usage:
     python train.py --epochs 1 --lr 3e-4 --device gpu:0
@@ -17,42 +18,32 @@ Usage:
 """
 
 import argparse
-from collections import deque
 import glob
-import hashlib
-import itertools
 import json
 import math
-import multiprocessing
 import os
 import random
 import signal
 import sys
 import time
 
+import numpy as np
 import torch
 
-from model import (
-    ChessTransformer,
-    ModelConfig,
-    legal_move_loss,
-    load_vocab,
-    tokenize_sample,
-)
+from fen_codec import RECORD_DTYPE
+from model import ChessTransformer, ModelConfig, legal_move_loss, make_batch
 
-VOCAB_PATH = "vocab.json"
 DATA_DIR = "data"
 CHECKPOINT_DIR = "checkpoints"
-MICRO_BATCH = 256
-ACCUM_STEPS = 2
+MOVES_PATH = "moves.json"
 DEFAULT_LR = 3e-4
-WEIGHT_DECAY = 0.1
+DEFAULT_WD = 0.1
 GRAD_CLIP = 1.0
-CHUNK_LINES = 2048
-WORKERS = min(8, max(1, (os.cpu_count() or 2) - 1))
-TASK_WINDOW = WORKERS * 2
+BATCH_SIZE = 512
+WARMUP_STEPS = 2000
+MIN_LR_RATIO = 0.1
+EVAL_SAMPLES = 20_000
 KEEP_CHECKPOINTS = 2
-SCAN_CHUNK = 1 << 22
 PROGRESS_INTERVAL = 2.0
 
 
@@ -73,7 +64,7 @@ def parse_args(argv=None):
         "--lr",
         type=float,
         default=None,
-        help="learning rate (default: 3e-4, or the checkpoint's lr when resuming)",
+        help="peak learning rate (default: 3e-4, or the checkpoint's lr when resuming)",
     )
     parser.add_argument(
         "--wd",
@@ -81,19 +72,23 @@ def parse_args(argv=None):
         default=None,
         help="AdamW weight decay on weights and embeddings (default: 0.1, or the checkpoint's wd when resuming)",
     )
+    parser.add_argument("--batch-size", type=positive_int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--max-samples",
+        type=positive_int,
+        default=None,
+        help="cap the number of training samples per epoch (default: all)",
+    )
     parser.add_argument("--device", default="gpu:0", help="cpu or gpu:N (default: gpu:0)")
     parser.add_argument("--resume", action="store_true", help="continue from the latest checkpoint in checkpoints/")
     parser.add_argument(
         "--checkpoint-cadence",
         dest="checkpoint_cadence",
         type=positive_int,
-        default=100000,
+        default=100_000,
         help="create a checkpoint every N training samples (default: 100000)",
     )
-    args = parser.parse_args(argv)
-    if args.checkpoint_cadence < MICRO_BATCH * ACCUM_STEPS:
-        parser.error(f"--checkpoint-cadence must be at least {MICRO_BATCH * ACCUM_STEPS}")
-    return args
+    return parser.parse_args(argv)
 
 
 def resolve_device(value):
@@ -117,84 +112,28 @@ def resolve_device(value):
     raise argparse.ArgumentTypeError(f"invalid device: {value}")
 
 
-def scan_file(path):
-    """Single pass over a file returning (sha256 hex digest, line count)."""
-    digest = hashlib.sha256()
-    lines = 0
-    with open(path, "rb") as file:
-        while chunk := file.read(SCAN_CHUNK):
-            digest.update(chunk)
-            lines += chunk.count(b"\n")
-    return digest.hexdigest(), lines
+def load_split(data_dir, stem):
+    meta_path = os.path.join(data_dir, "meta.json")
+    with open(meta_path, "r", encoding="utf-8") as file:
+        meta = json.load(file)
+    records = np.fromfile(os.path.join(data_dir, f"{stem}.bin"), dtype=RECORD_DTYPE)
+    legal_ids = np.fromfile(os.path.join(data_dir, f"{stem}.legal.bin"), dtype=np.uint16)
+    offsets = np.fromfile(os.path.join(data_dir, f"{stem}.legal_off.bin"), dtype=np.uint32)
+    if len(records) != meta[stem]["samples"] or len(offsets) != len(records) + 1:
+        sys.exit(f"error: {stem} shards do not match data/meta.json")
+    return meta, records, legal_ids, offsets
 
 
-def iter_chunks(path, start_line, chunk_size):
-    """Yield (first_line_number, lines) chunks starting at start_line."""
-    with open(path, "r", encoding="utf-8") as file:
-        if start_line:
-            deque(itertools.islice(file, start_line), maxlen=0)
-        chunk_start = start_line
-        buffer = []
-        for line in file:
-            buffer.append(line)
-            if len(buffer) == chunk_size:
-                yield chunk_start, buffer
-                chunk_start += len(buffer)
-                buffer = []
-        if buffer:
-            yield chunk_start, buffer
+def legal_lists(legal_ids, offsets, indices):
+    return [legal_ids[offsets[i] : offsets[i + 1]] for i in indices]
 
 
-def imap_window(pool, func, iterable, window):
-    """imap with bounded prefetch: at most `window` tasks in flight."""
-    iterator = iter(iterable)
-    pending = deque()
-    while True:
-        while len(pending) < window:
-            try:
-                item = next(iterator)
-            except StopIteration:
-                break
-            pending.append(pool.apply_async(func, (item,)))
-        if not pending:
-            return
-        yield pending.popleft().get()
-
-
-_worker_token_to_id = None
-
-
-def _init_worker():
-    global _worker_token_to_id
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    _worker_token_to_id = load_vocab(VOCAB_PATH)["token_to_id"]
-
-
-def _worker_legal_ids(sample):
-    from fen_codec import sample_to_board
-    from model import legal_move_ids
-
-    return legal_move_ids(sample, _worker_token_to_id)
-
-
-def _prepare_chunk(chunk):
-    """Tokenize one chunk of raw jsonl lines into trainable samples."""
-    chunk_start, lines = chunk
-    prepared = []
-    for offset, line in enumerate(lines):
-        try:
-            sample = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        tokenized = tokenize_sample(sample, _worker_token_to_id)
-        if tokenized is None:
-            continue
-        ids, target = tokenized
-        legal = _worker_legal_ids(sample)
-        if target not in legal:
-            continue
-        prepared.append((chunk_start + offset, ids, target, legal))
-    return prepared
+def lr_at(step, total_steps, peak):
+    if step < WARMUP_STEPS:
+        return peak * (step + 1) / WARMUP_STEPS
+    progress = min(1.0, (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS))
+    floor = peak * MIN_LR_RATIO
+    return floor + 0.5 * (peak - floor) * (1.0 + math.cos(math.pi * progress))
 
 
 def build_optimizer(model, lr, wd):
@@ -207,76 +146,6 @@ def build_optimizer(model, lr, wd):
         ],
         lr=lr,
     )
-
-
-def make_batch(samples, device):
-    tokens = torch.tensor([sample[1] for sample in samples], dtype=torch.long, device=device)
-    targets = torch.tensor([sample[2] for sample in samples], dtype=torch.long, device=device)
-    legal = [sample[3] for sample in samples]
-    return tokens, targets, legal
-
-
-def run_micro(model, batch, device, autocast_enabled):
-    tokens, targets, legal = batch
-    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-        logits = model(tokens)
-        loss = legal_move_loss(logits, legal, targets)
-    return loss
-
-
-def optimizer_step(model, optimizer):
-    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-
-
-def evaluate_slice(model, device, pool, eval_path, eval_offset, slice_size):
-    """Mean loss over the next slice_size eval samples starting at eval_offset.
-
-    Returns (mean_loss, new_offset).  Wraps around once at end of file.
-    """
-    model.eval()
-    total_loss = 0.0
-    counted = 0
-    position = eval_offset
-
-    def chunk_stream():
-        remaining = slice_size
-        pos = eval_offset
-        wrapped = False
-        while remaining > 0:
-            yielded = False
-            for chunk_start, lines in iter_chunks(eval_path, pos, CHUNK_LINES):
-                take = lines[:remaining]
-                yield chunk_start, take
-                pos = chunk_start + len(take)
-                remaining -= len(take)
-                yielded = True
-                if remaining <= 0:
-                    return
-            if not yielded or wrapped:
-                return
-            wrapped = True
-            pos = 0
-
-    batches = []
-    with torch.no_grad():
-        for prepared in imap_window(pool, _prepare_chunk, chunk_stream(), TASK_WINDOW):
-            batches.extend(prepared)
-            position = max(position, prepared[-1][0] + 1)
-            while len(batches) >= MICRO_BATCH:
-                micro, batches = batches[:MICRO_BATCH], batches[MICRO_BATCH:]
-                loss = run_micro(model, make_batch(micro, device), device, device.type == "cuda")
-                total_loss += loss.item() * len(micro)
-                counted += len(micro)
-        if batches:
-            loss = run_micro(model, make_batch(batches, device), device, device.type == "cuda")
-            total_loss += loss.item() * len(batches)
-            counted += len(batches)
-    model.train()
-    if counted == 0:
-        return None, position
-    return total_loss / counted, position
 
 
 def checkpoint_path(global_samples):
@@ -308,16 +177,19 @@ def prune_checkpoints():
         os.remove(path)
 
 
+def clear_checkpoints():
+    for path in glob.glob(os.path.join(CHECKPOINT_DIR, "ckpt_*.pt")):
+        os.remove(path)
+
+
 def latest_checkpoint_path():
     checkpoints = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "ckpt_*.pt")))
     return checkpoints[-1] if checkpoints else None
 
 
-def load_checkpoint(path, fingerprint, vocab_fingerprint, config, model, optimizer):
+def load_checkpoint(path, fingerprint, config, model, optimizer):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     state = payload["state"]
-    if state["vocab_fingerprint"] != vocab_fingerprint:
-        sys.exit("error: vocab.json changed since the checkpoint was written")
     if state["config"] != config.as_dict():
         sys.exit("error: model architecture changed since the checkpoint was written")
     model.load_state_dict(payload["model"])
@@ -327,28 +199,50 @@ def load_checkpoint(path, fingerprint, vocab_fingerprint, config, model, optimiz
         torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
     random.setstate(payload["rng"]["python"])
     if state["fingerprint"] == fingerprint:
-        print(f"resuming {path} at epoch {state['epoch']}, sample {state['offset']:,}")
-        return state["epoch"], state["offset"], state["eval_offset"]
+        print(
+            f"resuming {path} at epoch {state['epoch']}, "
+            f"sample {state['global_samples']:,}"
+        )
+        return state
     print(
         f"warning: training data changed since {path}; keeping weights, "
         "restarting the sample stream from the beginning"
     )
-    return 0, 0, 0
+    return None
 
 
-def make_state(fingerprint, vocab_fingerprint, config, epoch, offset, eval_offset, eval_loss, lr, wd, global_samples):
+def make_state(fingerprint, config, epoch, step_in_epoch, perm_seed, eval_loss, lr, wd, global_steps, global_samples):
     return {
         "fingerprint": fingerprint,
-        "vocab_fingerprint": vocab_fingerprint,
         "config": config.as_dict(),
         "epoch": epoch,
-        "offset": offset,
-        "eval_offset": eval_offset,
+        "step_in_epoch": step_in_epoch,
+        "perm_seed": perm_seed,
         "eval_loss": eval_loss,
         "lr": lr,
         "wd": wd,
+        "global_steps": global_steps,
         "global_samples": global_samples,
     }
+
+
+def evaluate_loss(model, device, records, legal_ids, offsets, autocast_enabled):
+    count = min(EVAL_SAMPLES, len(records))
+    indices = np.arange(count)
+    total = 0.0
+    seen = 0
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, count, BATCH_SIZE):
+            part = indices[start : start + BATCH_SIZE]
+            batch = make_batch(records[part], device)
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                logits = model(batch)
+                loss = legal_move_loss(logits, legal_lists(legal_ids, offsets, part), batch["targets"])
+            total += loss.item() * len(part)
+            seen += len(part)
+    model.train()
+    return total / seen if seen else None
 
 
 def format_duration(seconds):
@@ -357,149 +251,174 @@ def format_duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def handle_sigterm(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    signal.signal(signal.SIGTERM, handle_sigterm)
     args = parse_args()
     device = resolve_device(args.device)
     torch.manual_seed(0)
 
-    vocab = load_vocab(VOCAB_PATH)
-    vocab_fingerprint = vocab["fingerprint"]
-    config = ModelConfig(vocab_size=vocab["total_tokens"])
+    train_meta, train_records, train_legal, train_offsets = load_split(DATA_DIR, "train")
+    eval_meta, eval_records, eval_legal, eval_offsets = (None, None, None, None)
+    if os.path.isfile(os.path.join(DATA_DIR, "eval.bin")):
+        eval_meta, eval_records, eval_legal, eval_offsets = load_split(DATA_DIR, "eval")
 
-    train_path = os.path.join(DATA_DIR, "train.jsonl")
-    eval_path = os.path.join(DATA_DIR, "eval.jsonl")
-    if not os.path.isfile(train_path):
-        sys.exit(f"error: training data not found: {train_path}")
+    n = len(train_records)
+    if args.max_samples is not None:
+        n = min(n, args.max_samples)
+    fingerprint = train_meta["fingerprint"]
+    print(f"train samples: {len(train_records):,} (using {n:,})  eval samples: {len(eval_records):,}")
 
-    print(f"scanning {train_path}")
-    fingerprint, train_lines = scan_file(train_path)
-    eval_lines = 0
-    if os.path.isfile(eval_path):
-        _, eval_lines = scan_file(eval_path)
-    print(f"train samples: {train_lines:,}  eval samples: {eval_lines:,}")
-
-    pool = multiprocessing.Pool(WORKERS, initializer=_init_worker)
-
+    with open(MOVES_PATH, "r", encoding="utf-8") as file:
+        moves_fingerprint = json.load(file)["fingerprint"]
+    config = ModelConfig()
     model = ChessTransformer(config).to(device)
     print(f"model parameters: {sum(p.numel() for p in model.parameters()):,} on {device}")
+
     lr = args.lr if args.lr is not None else DEFAULT_LR
-    wd = args.wd if args.wd is not None else WEIGHT_DECAY
+    wd = args.wd if args.wd is not None else DEFAULT_WD
     optimizer = build_optimizer(model, lr, wd)
 
-    start_epoch, start_offset, eval_offset = 0, 0, 0
+    resume_state = None
     if args.resume:
         path = latest_checkpoint_path()
         if path is None:
             sys.exit("error: --resume but checkpoints/ contains no checkpoint")
-        start_epoch, start_offset, eval_offset = load_checkpoint(
-            path, fingerprint, vocab_fingerprint, config, model, optimizer
-        )
-        for index, group in enumerate(optimizer.param_groups):
+        resume_state = load_checkpoint(path, fingerprint, config, model, optimizer)
+        if resume_state is not None:
+            if resume_state.get("moves_fingerprint") not in (None, moves_fingerprint):
+                sys.exit("error: moves.json changed since the checkpoint was written")
             if args.lr is not None:
-                group["lr"] = args.lr
+                lr = args.lr
             if args.wd is not None:
-                group["weight_decay"] = args.wd if index == 0 else 0.0
-        if start_epoch >= args.epochs:
-            print("training already complete")
-            return
-    effective_lr = optimizer.param_groups[0]["lr"]
-    effective_wd = optimizer.param_groups[0]["weight_decay"]
-    print(f"optimizer learning rate {effective_lr:.4g}, weight decay {effective_wd:.4g}")
+                wd = args.wd
+            for index, group in enumerate(optimizer.param_groups):
+                group["lr"] = lr
+                group["weight_decay"] = wd if index == 0 else 0.0
+            if resume_state["epoch"] >= args.epochs:
+                print("training already complete")
+                return
+    if resume_state is None:
+        # Fresh stream: drop checkpoints from earlier runs so prune_checkpoints
+        # cannot delete new ones just because their sample counts are smaller.
+        clear_checkpoints()
 
-    cadence = args.checkpoint_cadence
-    expected_checkpoints = max(1, math.ceil(args.epochs * train_lines / cadence))
-    eval_slice_size = max(1, math.ceil(eval_lines / expected_checkpoints)) if eval_lines else 0
-    next_trigger = ((start_offset // cadence) + 1) * cadence
+    print(f"optimizer peak learning rate {lr:.4g}, weight decay {wd:.4g}")
+
+    batch_size = args.batch_size
+    steps_per_epoch = max(1, n // batch_size)
+    total_steps = steps_per_epoch * args.epochs
+    start_epoch = resume_state["epoch"] if resume_state else 0
+    start_step = resume_state["step_in_epoch"] if resume_state else 0
+    global_steps = resume_state["global_steps"] if resume_state else 0
+    global_samples = resume_state["global_samples"] if resume_state else 0
+    done_samples = global_samples
+    last_saved_global = None
+    next_trigger = ((global_samples // args.checkpoint_cadence) + 1) * args.checkpoint_cadence
 
     autocast_enabled = device.type == "cuda"
-    total_samples = args.epochs * train_lines
-    done_samples = start_epoch * train_lines + start_offset
     started_at = time.monotonic()
     last_progress = started_at
     loss_sum = 0.0
     loss_count = 0
-    last_saved_global = None
     epoch = start_epoch
-    lines_done = start_offset
-    model.train()
+    step_in_epoch = start_step
+    perm_seed = resume_state["perm_seed"] if resume_state else None
 
     try:
         for epoch in range(start_epoch, args.epochs):
-            epoch_start_offset = start_offset if epoch == start_epoch else 0
-            lines_done = epoch_start_offset
-            chunk_source = iter_chunks(train_path, epoch_start_offset, CHUNK_LINES)
-            buffer = []
-            micros_since_step = 0
+            if resume_state is not None and epoch == start_epoch and perm_seed is not None:
+                seed = perm_seed
+            else:
+                seed = random.randrange(2**32)
+            perm_seed = seed
+            order = np.random.default_rng(seed).permutation(len(train_records))[:n]
+            start_step = resume_state["step_in_epoch"] if (resume_state and epoch == start_epoch) else 0
+            step_in_epoch = start_step
 
-            for prepared in imap_window(pool, _prepare_chunk, chunk_source, TASK_WINDOW):
-                buffer.extend(prepared)
-                while len(buffer) >= MICRO_BATCH:
-                    micro, buffer = buffer[:MICRO_BATCH], buffer[MICRO_BATCH:]
-                    loss = run_micro(model, make_batch(micro, device), device, autocast_enabled)
-                    (loss / ACCUM_STEPS).backward()
-                    loss_sum += loss.item() * len(micro)
-                    loss_count += len(micro)
-                    lines_done = micro[-1][0] + 1
-                    done_samples = epoch * train_lines + lines_done
-                    micros_since_step += 1
-                    if micros_since_step < ACCUM_STEPS:
-                        continue
-                    optimizer_step(model, optimizer)
-                    micros_since_step = 0
+            for step_in_epoch in range(start_step, steps_per_epoch):
+                part = order[step_in_epoch * batch_size : (step_in_epoch + 1) * batch_size]
+                batch = make_batch(train_records[part], device)
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                    logits = model(batch)
+                    loss = legal_move_loss(logits, legal_lists(train_legal, train_offsets, part), batch["targets"])
+                loss.backward()
+                loss_sum += loss.item() * len(part)
+                loss_count += len(part)
 
-                    now = time.monotonic()
-                    if now - last_progress >= PROGRESS_INTERVAL:
-                        consumed = max(done_samples - start_epoch * train_lines - start_offset, 1)
-                        rate = consumed / (now - started_at)
-                        remaining = max(total_samples - done_samples, 0)
-                        mean_loss = loss_sum / loss_count
-                        progress = (
-                            f"epoch {epoch + 1}/{args.epochs}  samples {done_samples:,}/{total_samples:,}  "
-                            f"loss {mean_loss:.4f}  {rate:,.0f} samples/s  "
-                            f"ETA {format_duration(remaining / rate)}"
+                current_lr = lr_at(global_steps, total_steps, lr)
+                for group in optimizer.param_groups:
+                    group["lr"] = current_lr
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_steps += 1
+                global_samples += len(part)
+
+                now = time.monotonic()
+                if now - last_progress >= PROGRESS_INTERVAL:
+                    rate = (global_samples - done_samples) / max(now - started_at, 1e-9)
+                    remaining = max(total_steps * batch_size - global_samples, 0)
+                    mean_loss = loss_sum / max(loss_count, 1)
+                    print(
+                        f"epoch {epoch + 1}/{args.epochs}  "
+                        f"samples {global_samples:,}  "
+                        f"loss {mean_loss:.4f}  lr {current_lr:.2e}  "
+                        f"{rate:,.0f} samples/s  "
+                        f"ETA {format_duration(remaining / rate) if rate > 0 else 0}"
+                    )
+                    last_progress = now
+                    loss_sum = 0.0
+                    loss_count = 0
+
+                if global_samples >= next_trigger:
+                    while global_samples >= next_trigger:
+                        next_trigger += args.checkpoint_cadence
+                    eval_loss = None
+                    if eval_records is not None:
+                        eval_loss = evaluate_loss(
+                            model, device, eval_records, eval_legal, eval_offsets, autocast_enabled
                         )
-                        print(progress)
-                        last_progress = now
-                        loss_sum = 0.0
-                        loss_count = 0
-
-                    if lines_done >= next_trigger:
-                        while lines_done >= next_trigger:
-                            next_trigger += cadence
-                        eval_loss, eval_offset = evaluate_slice(
-                            model, device, pool, eval_path, eval_offset, eval_slice_size
-                        )
-                        state = make_state(
-                            fingerprint, vocab_fingerprint, config, epoch, lines_done,
-                            eval_offset, eval_loss, effective_lr, effective_wd, done_samples,
-                        )
-                        path = save_checkpoint(model, optimizer, state)
-                        prune_checkpoints()
-                        last_saved_global = done_samples
-                        print(f"checkpoint {path}  eval loss {eval_loss}")
-
-            if micros_since_step:
-                optimizer_step(model, optimizer)
-            start_offset = 0
+                    next_epoch = epoch
+                    next_step = step_in_epoch + 1
+                    if next_step >= steps_per_epoch:
+                        next_epoch, next_step = epoch + 1, 0
+                    state = make_state(
+                        fingerprint, config, next_epoch, next_step, perm_seed,
+                        eval_loss, lr, wd, global_steps, global_samples,
+                    )
+                    state["moves_fingerprint"] = moves_fingerprint
+                    path = save_checkpoint(model, optimizer, state)
+                    prune_checkpoints()
+                    last_saved_global = global_samples
+                    print(f"checkpoint {path}  eval loss {eval_loss}")
+            resume_state = None
     except KeyboardInterrupt:
         print("\ninterrupted; saving checkpoint")
         state = make_state(
-            fingerprint, vocab_fingerprint, config, epoch, lines_done,
-            eval_offset, None, effective_lr, effective_wd, epoch * train_lines + lines_done,
+            fingerprint, config, epoch, step_in_epoch, perm_seed,
+            None, lr, wd, global_steps, global_samples,
         )
-        if last_saved_global != state["global_samples"]:
+        state["moves_fingerprint"] = moves_fingerprint
+        if last_saved_global != global_samples:
             save_checkpoint(model, optimizer, state)
             prune_checkpoints()
         raise SystemExit(130)
 
-    if last_saved_global != done_samples:
-        eval_loss, eval_offset = evaluate_slice(
-            model, device, pool, eval_path, eval_offset, eval_slice_size
-        )
+    if last_saved_global != global_samples:
+        eval_loss = None
+        if eval_records is not None:
+            eval_loss = evaluate_loss(
+                model, device, eval_records, eval_legal, eval_offsets, autocast_enabled
+            )
         state = make_state(
-            fingerprint, vocab_fingerprint, config, args.epochs, 0,
-            eval_offset, eval_loss, effective_lr, effective_wd, done_samples,
+            fingerprint, config, args.epochs, 0, perm_seed,
+            eval_loss, lr, wd, global_steps, global_samples,
         )
+        state["moves_fingerprint"] = moves_fingerprint
         path = save_checkpoint(model, optimizer, state)
         prune_checkpoints()
         print(f"\ncheckpoint {path}  eval loss {eval_loss}")

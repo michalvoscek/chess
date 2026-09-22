@@ -13,6 +13,9 @@ Application should accept input:
 and return output:
 1. probabilities for all legal moves in given position
 
+Moves are predicted as UCI (`e2e4`, `e7e8q`, `e1g1`) and reported as SAN so
+callers keep working with SAN.
+
 ## Scripts
 
 ### Download
@@ -33,146 +36,142 @@ decompress game files
 python process_lichess_db.py --max-games 1000000
 ```
 
-Instead of one sample per game, create one sample for every move.  
-Output should be jsonl files.  
-Output should be 2 files train.jsonl and eval.jsonl games split 90/10.  
-Skips game if unable to extract some information (like ELO).  
-Use nearest 100 ELO bracket.  
+Creates one sample for every move.  Output is binary shards in `data/`
+(see `fen_codec.py` for the 80-byte record layout):
+
+| File | Contents |
+|---|---|
+| `train.bin` / `eval.bin` | `RECORD_DTYPE` records (squares, elo, stm, castling, ep, target, history) |
+| `train.legal.bin` / `eval.legal.bin` | uint16 flat legal-move id lists |
+| `train.legal_off.bin` / `eval.legal_off.bin` | uint32 CSR offsets (`n+1`) |
+| `meta.json` | counts and fingerprint |
+
+Games are split 90/10 in input order (first 90 percent → train).  Games
+missing Elo (or with PGN errors) are skipped.  Elo is rounded to the nearest
+100 and stored as an index `0..40`.  The legal move id list of every
+position is precomputed so training never needs `python-chess`.
+
 args:
 --max-games: limit games in output files
 --input: source `.pgn.zst` file
 
-
-Example row in train/eval data:
-
-```json
-{"elo":1800,"position":"rnbqkbnrpppppppp....................P...........PPPP.PPPRNBQKBNR","castling_wk":"<TRUE>","castling_wq":"<TRUE>","castling_bk":"<TRUE>","castling_bq":"<TRUE>","side_to_move":"b","en_passant":"-","halfmove_clock":0,"fullmove_number":1,"history":["<NONE>","<NONE>","<NONE>","<NONE>","e4"],"move":"e5"}
-```
-
-### Generate vocabulary
+### Generate move vocabulary
 
 ```bash
-make_move_vocab.py
+python move_vocab.py
 ```
 
-Generates whole vocabulary into `vocab.json`.
-
-args:
---verify: ability to verify that games have all necessary tokens.
+Writes `moves.json`: the 1,968 UCI moves (from-to-promo) legal in some
+position, plus a fingerprint.  Id `1968` is the history pad token `<NONE>`.
 
 ## Tokenization
 
-The position is encoded as a fixed-length token sequence of 78 tokens
-(no padding needed) instead of FEN characters:
+Input is a fixed 74-token sequence.  Each field has its own embedding table
+so tokens cannot collide (the old shared vocab made `b` mean both "black to
+move" and "black bishop").
 
-| Segment | Token values | Count | Values per position |
+| Segment | Values | Count | Embedding |
 |---|---|---|---|
-| elo | `<PLAYER_ELO_0>`…`<PLAYER_ELO_4000>` | 1 | 41 |
-| squares, a8→h1 rank-major | 13 (`K`…`p`, `.`) | 64 | 13 |
-| castling_wk | `<TRUE>`/`<FALSE>` | 1 | 2 |
-| castling_wq | `<TRUE>`/`<FALSE>` | 1 | 2 |
-| castling_bk | `<TRUE>`/`<FALSE>` | 1 | 2 |
-| castling_bq | `<TRUE>`/`<FALSE>` | 1 | 2 |
-| side to move | `w` / `b` | 1 | 2 |
-| en passant | target square or `-` | 1 | 65 |
-| halfmove clock | 0–300 (plies since capture/pawn move) | 1 | 201 |
-| fullmove number | 0–300 (after Black's move) | 1 | 301 |
-| history | SAN tokens, front-`<NONE>` padded | 5 | move vocab + 1 |
-| **Total** | | **78 tokens, always** |
+| elo | index 0–40 (Elo/100) | 1 | 41 |
+| squares, a1→h8 | 13 (`0`, `PNBRQK`, `pnbrqk`) | 64 | piece 13 + square 64 |
+| side to move | 0/1 | 1 | 2 |
+| castling | 4-bit mask | 1 | 16 |
+| en passant | 0 = none, else square+1 | 1 | 65 |
+| history | UCI move ids, front-`<NONE>` padded | 5 | move table |
+| `<QUERY>` | learned readout token | 1 | parameter |
+| **Total** | | **74 tokens, always** | |
 
-If for some reason tokens miss e.g. games has more that 300 moves skip game in training show error for inference.
+Output is a logit per UCI move (plus `<NONE>`, never legal and never a
+target), taken as `h_query @ move_emb.T`.  History and output share the move
+embedding because they denote the same concept.
 
-For moves use one token per move.
-
-Good examples
-```
-e4
-Nf3
-Bb5
-O-O
-Qxe5+
-```
-
-Avoid character-level tokenization.
-
-Special tokens:
-
-```
-<NONE>
-<TRUE>
-<FALSE>
-<PLAYER_ELO_1200>
-etc.
-```
+If a value has no token (out-of-range Elo), the sample is skipped for
+training and an error is shown for inference.
 
 ## Train
 
-Use batches of size 512 moves via gradient accumulation 2×256.  
-Stream data sequentionally no shuffling.  
-Use eval for every checkpoint creation. Use proportional slice to training data, so if batching splits train data on 100 parts use first 1/100 ffor fist checkpoint eval second 1/100 for second eval.  
+```bash
+python train.py
+```
+
+Shuffles the sample order every epoch (a batch of 256 consecutive moves
+comes from ~6 whole games, which makes gradients useless without shuffling).
+Effective batch size 512 via gradient accumulation 2×256.
+
+args:
+--epochs: n - how many times to go thru training data  
+--lr: r - peak learning rate (default 0.0003); warmup 2000 steps then cosine decay to 10%  
+--wd: AdamW weight decay on weights and embeddings (default 0.1)  
+--batch-size: n (default 512)  
+--max-samples: cap training samples per epoch (default: all)  
+--device: cpu or gpu:1 what device to use for training  
+--resume: continue from the latest checkpoint in `checkpoints/`  
+--checkpoint-cadence: after how many samples a checkpoint is created  
 
 ### Optimizer
 
 AdamW
 
 Weight decay        0.1 (applied to weights + embeddings only; biases and RMSNorm gains excluded)
-Learning rate       3e-4
+Peak learning rate  3e-4 (linear warmup 2000 steps, then cosine to 3e-5)
 Gradient clipping   1
 
 ### Model
-Decoder-only Transformer
 
-Layers:                                12
+Decoder-only Transformer over the 74-token sequence
+
+Layers:                                8
 Hidden Size (embedding dimension):     512
 Attention Heads:                       8
 FFN Size (4× hidden size):             2048
-Context:                               78 tokens
-Parameters:                            ~45–60M
-Positional encoding:                   learned embeddings (78 × 512 table, trained with the model)
+Context:                               74 tokens
+Parameters:                            ~26M
+Positional encoding:                   learned embeddings (74 × 512 table, trained with the model)
 Normalization                          pre-norm + RMSNorm
-Vocabulary                             fixed `vocab.json`, generated by `make_move_vocab.py`
+Move vocabulary                        1,968 UCI moves (`moves.json`)
 Activation                             GELU
 Dropout                                0.1
 Precision                              bf16
 
-Input and output embeddings should be tied.
-
-```bash
-python train.py
-```
-flags:
---epochs: n - how many times to go thru training data  
---lr: r - default 0.0003, how much should training affect weights, learning rate should be constant over entire run  
---device: cpu or gpu:1 what device to use for training  
+Readout is the `<QUERY>` hidden state; the output projection is tied to the
+history move embedding.
 
 ### Resuming after data changes
 
-When `data/train.jsonl` is replaced with new games, continue training from
-the old weights instead of random init.
-
-For ELO there should be be predefined tokens from `<PLAYER_ELO_0>` to `<PLAYER_ELO_4000>` incrementing by 100. So extending is not needed here.
-
-For training data fingerprint should be calculated so using sha256 of `train.jsonl`
-
-```bash
-python train.py --epochs 1 --lr 3e-4
-```
-
---resume: initialize latest checkpoint based on training data fingerprint and offset in train samples stream automatically saved;
---checkpoint-cadence: number, after how many samples should checkpoint be created
---lr: learning rate to use, default 0.0003
---wd: AdamW weight decay on weights, default 0.1 (lower value should make loss decrease faster)
+When `data/train.bin` is replaced with new games, continue training from the
+old weights instead of random init.  `train.py` keeps the weights but resets
+the sample stream when `data/meta.json`'s fingerprint changed.
 
 ### Loss
 
-Cross entropy with softmax thru legal moves in vocabulary only.  
-Library `python-chess` used to generate legal moves.  
-Only the move contributes (FEN/history get no target).  
+Cross entropy with softmax thru legal moves in vocabulary only (precomputed
+in the shards).  Only the move contributes (position fields get no target).
+
+## Evaluate
+
+```bash
+python evaluate.py
+```
+
+Reports on `data/eval.bin`:
+
+1. **Move-match** top-1 / top-3 / CE against held-out human moves, bucketed
+   by the player's Elo.  Humans agree with other humans on roughly 40–55%
+   of moves (top-1) — that is the reference band.
+2. **Cross-Elo CE matrix** — the same positions re-evaluated with the Elo
+   token overwritten.  A visible diagonal means the model uses Elo.
+3. **Elo KL probe** — mean `KL(p_low || p_high)` over legal moves.  Near
+   zero means the model ignores Elo.
+
+args:
+--checkpoint: checkpoint file (default: latest)
+--samples / --cross-elo-samples / --kl-samples: sample counts
+--device / --batch-size
 
 ## Inference
 
 Program should interpret game so far, calculate current position and last 5 moves.  
-Forward pass produces logits from that probablities are calculated using softmax algorithm.
+Forward pass produces logits; softmax over legal moves gives probabilities.
 
 ```bash
 python infer.py --elo 1800 --pgn "1. e4 e5 2. Nf3 *"
@@ -183,18 +182,13 @@ flags:
 --pgn: game so far in pgn format empty on first move  
 --model: checkpoint file (in `.pt` format), by default latest is used based on `checkpoints/ckpt_*.pt` search  
 --device: `cpu` or `gpu<n>` default is `gpu:0`  
+--temperature: softmax temperature (default 1.0; higher plays more loosely)
 
-Output is JSON with probabilities:
+Output is JSON with probabilities in SAN:
 
 ```json
 [{"move": "e5", "p": 0.418}, {"move": "Nf6", "p": 0.305}]
 ```
-
-
-## Possible improvements
-
-Consider warmup for and cosine decay for learning rate.  
-
 
 ## GUI
 
@@ -202,9 +196,10 @@ Simple GUI written in react using chessground.js library to visualize and input 
 Should have one screen at start containing:
 1. standard chess board in opening position
 2. input for elo (allow any number but should be rounded to closest available token for expressing elo), elo can change during game
-3. button that plays next move (no matter what color has turn computer can play both both sides), move played should be based on probablity it recieves from inference of the model
-4. buttons to restart game and undo last move
-5. list of moves played in pgn format
+3. input for temperature (1 = human-like sampling, higher = looser)
+4. button that plays next move (no matter what color has turn computer can play both both sides), move played should be based on probability it recieves from inference of the model
+5. buttons to restart game and undo last move
+6. list of moves played in pgn format
 
 Board shouls allow user to make only legal moves.  
 Promotions should be handled by picker dialog.  

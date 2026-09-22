@@ -74,6 +74,7 @@ export default function Home() {
 
   const [fen, setFen] = useState(game.fen());
   const [eloInput, setEloInput] = useState("1500");
+  const [temperatureInput, setTemperatureInput] = useState("1");
   const [autoplay, setAutoplay] = useState<"none" | "white" | "black">("none");
   const [thinking, setThinking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -176,7 +177,11 @@ export default function Home() {
       const res = await fetch("/api/infer", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ elo, pgn: buildPgn(history) }),
+        body: JSON.stringify({
+          elo,
+          pgn: buildPgn(history),
+          temperature: Number(temperatureInput),
+        }),
       });
       const data = (await res.json()) as { moves?: InferMove[]; error?: string };
       if (!res.ok || !data.moves) {
@@ -261,6 +266,22 @@ export default function Home() {
           {appliedElo !== null && (
             <span className="text-xs text-zinc-500">applied as {appliedElo}</span>
           )}
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor="temperature" className="text-sm font-medium text-zinc-400">
+            temperature
+          </label>
+          <input
+            id="temperature"
+            type="number"
+            min={0.1}
+            max={5}
+            step={0.1}
+            value={temperatureInput}
+            onChange={(event) => setTemperatureInput(event.target.value)}
+            className="rounded-lg border border-zinc-600 bg-zinc-900 px-3 py-2 text-lg text-zinc-100 outline-none focus:border-zinc-400"
+          />
+          <span className="text-xs text-zinc-500">1 = human-like, higher = looser</span>
         </div>
         <div className="flex flex-col gap-2">
           <button onClick={playNext} disabled={thinking || gameOver} className={buttonClass}>

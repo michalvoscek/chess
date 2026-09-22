@@ -23,6 +23,7 @@ const PYTHON_BIN = process.env.PYTHON_BIN ?? path.join(REPO_ROOT, "venv", "bin",
 interface InferBody {
   elo?: unknown;
   pgn?: unknown;
+  temperature?: unknown;
 }
 
 export async function POST(request: Request) {
@@ -33,13 +34,19 @@ export async function POST(request: Request) {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { elo, pgn } = body;
+  const { elo, pgn, temperature } = body;
   if (typeof elo !== "number" || !Number.isInteger(elo)) {
     return Response.json({ error: "elo must be an integer" }, { status: 400 });
   }
+  if (
+    temperature !== undefined &&
+    (typeof temperature !== "number" || !(temperature > 0))
+  ) {
+    return Response.json({ error: "temperature must be a positive number" }, { status: 400 });
+  }
   const pgnText = typeof pgn === "string" ? pgn : "";
 
-  const result = await runInfer(elo, pgnText);
+  const result = await runInfer(elo, pgnText, temperature);
   if (result.error) {
     return Response.json({ error: result.error }, { status: 500 });
   }
@@ -52,12 +59,20 @@ export async function POST(request: Request) {
   }
 }
 
-function runInfer(elo: number, pgn: string): Promise<{ stdout: string; error?: string }> {
+function runInfer(
+  elo: number,
+  pgn: string,
+  temperature?: number,
+): Promise<{ stdout: string; error?: string }> {
   return new Promise((resolve) => {
+    const args = ["infer.py", "--elo", String(elo), "--pgn", pgn];
+    if (temperature !== undefined) {
+      args.push("--temperature", String(temperature));
+    }
     const proc = spawn(
       /*turbopackIgnore: true*/
       PYTHON_BIN,
-      ["infer.py", "--elo", String(elo), "--pgn", pgn],
+      args,
       {
         cwd: REPO_ROOT,
       },
