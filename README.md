@@ -99,7 +99,7 @@ comes from ~6 whole games, which makes gradients useless without shuffling).
 Effective batch size 512 via gradient accumulation 2×256.
 
 args:
---epochs: n - how many times to go thru training data  
+--epochs: n - how many times to go thru training data; with --resume, passes already completed in the checkpoint count toward n  
 --lr: r - peak learning rate (default 0.0003); warmup 2000 steps then cosine decay to 10%  
 --wd: AdamW weight decay on weights and embeddings (default 0.1)  
 --batch-size: n (default 512)  

@@ -8,9 +8,12 @@ learning-rate warmup followed by cosine decay, gradient clipping at 1
 and bf16 autocast on CUDA.  Every --checkpoint-cadence samples the model
 is evaluated on a fixed slice of data/eval.bin and a checkpoint is
 written to checkpoints/ containing the optimizer state and the exact
-epoch/shuffle position so training can be resumed with --resume.  If the
-training data changed since the checkpoint (different meta.json
-fingerprint) the weights are kept but the stream position is reset.
+epoch/shuffle position so training can be resumed with --resume.  With
+--resume, passes already counted in the checkpoint count toward
+--epochs; if the checkpoint already covers them all, nothing is
+trained.  If the training data changed since the checkpoint (different
+meta.json fingerprint) the weights are kept but the stream position is
+reset.
 
 Usage:
     python train.py --epochs 1 --lr 3e-4 --device gpu:0
@@ -59,7 +62,7 @@ def positive_int(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the chess move model")
-    parser.add_argument("--epochs", type=positive_int, default=1, help="passes over the training data (default: 1)")
+    parser.add_argument("--epochs", type=positive_int, default=1, help="passes over the training data (default: 1; with --resume, passes completed in the checkpoint count toward it)")
     parser.add_argument(
         "--lr",
         type=float,
@@ -298,9 +301,6 @@ def main():
             for index, group in enumerate(optimizer.param_groups):
                 group["lr"] = lr
                 group["weight_decay"] = wd if index == 0 else 0.0
-            if resume_state["epoch"] >= args.epochs:
-                print("training already complete")
-                return
     if resume_state is None:
         # Fresh stream: drop checkpoints from earlier runs so prune_checkpoints
         # cannot delete new ones just because their sample counts are smaller.
@@ -311,10 +311,28 @@ def main():
     batch_size = args.batch_size
     steps_per_epoch = max(1, n // batch_size)
     total_steps = steps_per_epoch * args.epochs
-    start_epoch = resume_state["epoch"] if resume_state else 0
-    start_step = resume_state["step_in_epoch"] if resume_state else 0
     global_steps = resume_state["global_steps"] if resume_state else 0
     global_samples = resume_state["global_samples"] if resume_state else 0
+    epoch_samples = steps_per_epoch * batch_size
+    start_epoch = 0
+    start_step = 0
+    if resume_state is not None:
+        start_epoch = global_samples // epoch_samples
+        start_step = (global_samples % epoch_samples) // batch_size
+        if (start_epoch, start_step) != (resume_state["epoch"], resume_state["step_in_epoch"]):
+            print(
+                f"note: checkpoint position epoch {resume_state['epoch']}, "
+                f"step {resume_state['step_in_epoch']:,} disagrees with "
+                f"global_samples {global_samples:,} (train size or batch size "
+                f"changed since it was written); resuming from "
+                f"epoch {start_epoch}, step {start_step:,}"
+            )
+    if start_epoch >= args.epochs:
+        print(
+            f"checkpoint has completed {start_epoch} of the {args.epochs} "
+            "requested passes; nothing to train - raise --epochs to train more"
+        )
+        return
     done_samples = global_samples
     last_saved_global = None
     next_trigger = ((global_samples // args.checkpoint_cadence) + 1) * args.checkpoint_cadence
@@ -336,7 +354,7 @@ def main():
                 seed = random.randrange(2**32)
             perm_seed = seed
             order = np.random.default_rng(seed).permutation(len(train_records))[:n]
-            start_step = resume_state["step_in_epoch"] if (resume_state and epoch == start_epoch) else 0
+            start_step = start_step if (resume_state is not None and epoch == start_epoch) else 0
             step_in_epoch = start_step
 
             for step_in_epoch in range(start_step, steps_per_epoch):
@@ -395,11 +413,11 @@ def main():
                     prune_checkpoints()
                     last_saved_global = global_samples
                     print(f"checkpoint {path}  eval loss {eval_loss}")
-            resume_state = None
+        resume_state = None
     except KeyboardInterrupt:
         print("\ninterrupted; saving checkpoint")
         state = make_state(
-            fingerprint, config, epoch, step_in_epoch, perm_seed,
+            fingerprint, config, epoch, step_in_epoch + 1, perm_seed,
             None, lr, wd, global_steps, global_samples,
         )
         state["moves_fingerprint"] = moves_fingerprint
