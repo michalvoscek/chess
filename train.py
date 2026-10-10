@@ -13,7 +13,9 @@ epoch/shuffle position so training can be resumed with --resume.  With
 --epochs; if the checkpoint already covers them all, nothing is
 trained.  If the training data changed since the checkpoint (different
 meta.json fingerprint) the weights are kept but the stream position is
-reset.
+reset.  Every progress window (~2 s) appends the mean train loss and every
+checkpoint its eval loss to checkpoints/loss_history.jsonl, keyed by the
+cumulative number of samples trained; plot it with plot_loss.py.
 
 Usage:
     python train.py --epochs 1 --lr 3e-4 --device gpu:0
@@ -38,6 +40,7 @@ from model import ChessTransformer, ModelConfig, legal_move_loss, make_batch
 
 DATA_DIR = "data"
 CHECKPOINT_DIR = "checkpoints"
+LOSS_HISTORY_PATH = os.path.join(CHECKPOINT_DIR, "loss_history.jsonl")
 MOVES_PATH = "moves.json"
 DEFAULT_LR = 3e-4
 DEFAULT_WD = 0.1
@@ -185,6 +188,19 @@ def clear_checkpoints():
         os.remove(path)
 
 
+def append_history(row):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    with open(LOSS_HISTORY_PATH, "a", encoding="utf-8") as file:
+        file.write(json.dumps(row) + "\n")
+
+
+def clear_history():
+    try:
+        os.remove(LOSS_HISTORY_PATH)
+    except FileNotFoundError:
+        pass
+
+
 def latest_checkpoint_path():
     checkpoints = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "ckpt_*.pt")))
     return checkpoints[-1] if checkpoints else None
@@ -301,10 +317,19 @@ def main():
             for index, group in enumerate(optimizer.param_groups):
                 group["lr"] = lr
                 group["weight_decay"] = wd if index == 0 else 0.0
+            if resume_state.get("eval_loss") is not None:
+                append_history(
+                    {
+                        "kind": "eval",
+                        "samples": resume_state["global_samples"],
+                        "loss": resume_state["eval_loss"],
+                    }
+                )
     if resume_state is None:
         # Fresh stream: drop checkpoints from earlier runs so prune_checkpoints
         # cannot delete new ones just because their sample counts are smaller.
         clear_checkpoints()
+        clear_history()
 
     print(f"optimizer peak learning rate {lr:.4g}, weight decay {wd:.4g}")
 
@@ -381,6 +406,15 @@ def main():
                     rate = (global_samples - done_samples) / max(now - started_at, 1e-9)
                     remaining = max(total_steps * batch_size - global_samples, 0)
                     mean_loss = loss_sum / max(loss_count, 1)
+                    append_history(
+                        {
+                            "kind": "train",
+                            "samples": global_samples,
+                            "loss": mean_loss,
+                            "lr": current_lr,
+                            "t": now - started_at,
+                        }
+                    )
                     print(
                         f"epoch {epoch + 1}/{args.epochs}  "
                         f"samples {global_samples:,}  "
@@ -413,6 +447,10 @@ def main():
                     prune_checkpoints()
                     last_saved_global = global_samples
                     print(f"checkpoint {path}  eval loss {eval_loss}")
+                    if eval_loss is not None:
+                        append_history(
+                            {"kind": "eval", "samples": global_samples, "loss": eval_loss}
+                        )
         resume_state = None
     except KeyboardInterrupt:
         print("\ninterrupted; saving checkpoint")
@@ -440,6 +478,10 @@ def main():
         path = save_checkpoint(model, optimizer, state)
         prune_checkpoints()
         print(f"\ncheckpoint {path}  eval loss {eval_loss}")
+        if eval_loss is not None:
+            append_history(
+                {"kind": "eval", "samples": global_samples, "loss": eval_loss}
+            )
     print("training complete")
 
 

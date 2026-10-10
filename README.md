@@ -106,7 +106,23 @@ args:
 --max-samples: cap training samples per epoch (default: all)  
 --device: cpu or gpu:1 what device to use for training  
 --resume: continue from the latest checkpoint in `checkpoints/`  
---checkpoint-cadence: after how many samples a checkpoint is created  
+--checkpoint-cadence: after how many samples a checkpoint is created
+
+### Loss history
+
+Every progress window (~2 s) appends the mean train loss and every
+checkpoint its eval loss to `checkpoints/loss_history.jsonl`, keyed by the
+cumulative number of samples trained.  Fresh runs start a new file,
+`--resume` appends to it.  Render the curve with:
+
+```bash
+python plot_loss.py            # writes loss_curve.png
+```
+
+args:
+--history: history file to plot (default: `checkpoints/loss_history.jsonl`)
+--out: output image (default: `loss_curve.png`)
+--smooth: rolling window over train points, 1 disables (default: 10)  
 
 ### Optimizer
 
