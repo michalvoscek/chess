@@ -42,7 +42,7 @@ def parse_args(argv=None):
         default=HISTORY_PATH,
         help="loss history written by train.py (default: checkpoints/loss_history.jsonl)",
     )
-    parser.add_argument("--out", default="loss_curve.png", help="output image (default: loss_curve.png)")
+    parser.add_argument("--out", default="plots/loss_curve.png", help="output image (default: plots/loss_curve.png)")
     parser.add_argument(
         "--smooth",
         type=positive_int,
@@ -106,6 +106,9 @@ def main():
     axis.grid(True, alpha=0.3)
     axis.legend(loc="upper right")
     fig.tight_layout()
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     fig.savefig(args.out)
     print(f"wrote {args.out} ({len(train_rows)} train rows, {len(eval_rows)} eval rows)")
 
