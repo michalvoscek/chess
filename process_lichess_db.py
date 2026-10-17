@@ -4,6 +4,7 @@
 Usage:
     python process_lichess_db.py --max-games 1000000
     python process_lichess_db.py --max-games 1000000 --input path/to/games.pgn.zst
+    python process_lichess_db.py --max-games 2000000 --skip-games 2000000
 
 Writes binary shards into data/:
 
@@ -15,6 +16,9 @@ Writes binary shards into data/:
 Games are assigned in input order: the first 90 percent of valid games go to
 training and the remaining 10 percent to evaluation.  The legal move id list
 of every position is precomputed so the training loop never needs python-chess.
+--skip-games discards the first N valid games of the stream first, so
+successive chunks of the same archive pick up where the previous chunk
+ended (chunk k at 2000000 games per chunk uses --skip-games 2000000 * (k - 1)).
 """
 
 import argparse
@@ -54,6 +58,13 @@ def parse_args(argv=None):
         "--input",
         dest="input_path",
         help="source .pgn.zst file (default: latest matching file in data/)",
+    )
+    parser.add_argument(
+        "--skip-games",
+        dest="skip_games",
+        type=positive_int,
+        default=0,
+        help="discard the first N valid games of the stream before processing",
     )
     return parser.parse_args(argv)
 
@@ -181,6 +192,37 @@ def render_progress(games, max_games, samples, skipped, started_at):
     sys.stdout.flush()
 
 
+def skip_games(pgn_file, count):
+    """Discard the first count valid games of the stream (header-level check)."""
+    raw_games = 0
+    valid_games = 0
+    started_at = time.monotonic()
+    last_progress = started_at
+    progress_written = False
+    while valid_games < count:
+        game = chess.pgn.read_game(pgn_file)
+        if game is None:
+            sys.exit(f"error: input ended after {valid_games:,} of {count:,} games to skip")
+        raw_games += 1
+        white_elo = elo_index(game.headers.get("WhiteElo"))
+        black_elo = elo_index(game.headers.get("BlackElo"))
+        if white_elo is not None and black_elo is not None and not game.errors:
+            valid_games += 1
+        now = time.monotonic()
+        if now - last_progress >= PROGRESS_INTERVAL:
+            elapsed = max(now - started_at, 1e-9)
+            line = (
+                f"skipping {valid_games:,}/{count:,} valid games  "
+                f"read {raw_games:,}  {raw_games / elapsed:,.0f} games/s"
+            )
+            sys.stdout.write("\r" + line.ljust(120))
+            sys.stdout.flush()
+            last_progress = now
+            progress_written = True
+    if progress_written:
+        print()
+
+
 def main():
     args = parse_args()
     data_dir = get_data_dir()
@@ -192,8 +234,6 @@ def main():
     os.makedirs(data_dir, exist_ok=True)
     print(f"processing {input_path}")
 
-    train_split = Split(data_dir, "train")
-    eval_split = Split(data_dir, "eval")
     train_game_limit = math.floor(args.max_games * 0.9)
 
     processed_games = 0
@@ -204,12 +244,18 @@ def main():
     started_at = time.monotonic()
     last_progress = started_at
     progress_written = False
+    train_split = None
+    eval_split = None
 
     try:
         with open(input_path, "rb") as compressed_file:
             decompressor = zstandard.ZstdDecompressor()
             with decompressor.stream_reader(compressed_file) as decompressed_file:
                 with io.TextIOWrapper(decompressed_file, encoding="utf-8") as pgn_file:
+                    if args.skip_games:
+                        skip_games(pgn_file, args.skip_games)
+                    train_split = Split(data_dir, "train")
+                    eval_split = Split(data_dir, "eval")
                     while processed_games < args.max_games:
                         game = chess.pgn.read_game(pgn_file)
                         if game is None:
@@ -255,36 +301,39 @@ def main():
         print("interrupted; partial output was kept")
         raise SystemExit(130)
     finally:
-        train_meta = train_split.close()
-        eval_meta = eval_split.close()
-        fingerprint = hashlib.sha256(
-            f"{train_meta}|{eval_meta}|{train_games}|{eval_games}".encode("utf-8")
-        ).hexdigest()
-        meta = {
-            "format": 1,
-            "record_bytes": RECORD_DTYPE.itemsize,
-            "none_move": NONE_MOVE,
-            "train_games": train_games,
-            "eval_games": eval_games,
-            "skipped_games": skipped_games,
-            "train": train_meta,
-            "eval": eval_meta,
-            "fingerprint": fingerprint,
-        }
-        meta_path = os.path.join(data_dir, "meta.json")
-        with open(meta_path, "w", encoding="utf-8") as file:
-            json.dump(meta, file, indent=2)
-            file.write("\n")
-
-    if progress_written:
-        print()
-    print(
-        f"processed {processed_games:,} games "
-        f"({train_games:,} train / {eval_games:,} eval); "
-        f"skipped {skipped_games:,}"
-    )
-    print(f"wrote {train_meta['samples']:,} train and {eval_meta['samples']:,} eval samples")
-    print(f"wrote {os.path.join(data_dir, 'meta.json')}")
+        if train_split is not None:
+            train_meta = train_split.close()
+            eval_meta = eval_split.close()
+            fingerprint = hashlib.sha256(
+                f"{train_meta}|{eval_meta}|{train_games}|{eval_games}".encode("utf-8")
+            ).hexdigest()
+            meta = {
+                "format": 1,
+                "record_bytes": RECORD_DTYPE.itemsize,
+                "none_move": NONE_MOVE,
+                "train_games": train_games,
+                "eval_games": eval_games,
+                "skipped_games": skipped_games,
+                "train": train_meta,
+                "eval": eval_meta,
+                "fingerprint": fingerprint,
+            }
+            meta_path = os.path.join(data_dir, "meta.json")
+            with open(meta_path, "w", encoding="utf-8") as file:
+                json.dump(meta, file, indent=2)
+                file.write("\n")
+            if progress_written:
+                print()
+            print(
+                f"processed {processed_games:,} games "
+                f"({train_games:,} train / {eval_games:,} eval); "
+                f"skipped {skipped_games:,}"
+            )
+            print(
+                f"wrote {train_meta['samples']:,} train and "
+                f"{eval_meta['samples']:,} eval samples"
+            )
+            print(f"wrote {os.path.join(data_dir, 'meta.json')}")
 
 
 if __name__ == "__main__":

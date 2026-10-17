@@ -53,6 +53,7 @@ position is precomputed so training never needs `python-chess`.
 
 args:
 --max-games: limit games in output files
+--skip-games: discard the first N valid games of the stream first (chunk k of an archive at 2M games per chunk uses `--skip-games 2000000 * (k - 1)`)
 --input: source `.pgn.zst` file
 
 ### Generate move vocabulary
@@ -100,7 +101,9 @@ Effective batch size 512 via gradient accumulation 2×256.
 
 args:
 --epochs: n - how many times to go thru training data; with --resume, passes already completed in the checkpoint count toward n  
---lr: r - peak learning rate (default 0.0003); warmup 2000 steps then cosine decay to 10%  
+--lr: r - schedule peak lr, the lr at 0 cumulative samples (default 0.0003); warmup 2000 steps then geometric decay  
+--lr-decay: lr multiplier per --lr-decay-samples of cumulative training (default 0.9; 1 keeps the lr constant)  
+--lr-decay-samples: cumulative samples per --lr-decay multiplier (default 100000000)  
 --wd: AdamW weight decay on weights and embeddings (default 0.1)  
 --batch-size: n (default 512)  
 --max-samples: cap training samples per epoch (default: all)  
@@ -155,8 +158,12 @@ history move embedding.
 ### Resuming after data changes
 
 When `data/train.bin` is replaced with new games, continue training from the
-old weights instead of random init.  `train.py` keeps the weights but resets
-the sample stream when `data/meta.json`'s fingerprint changed.
+old weights instead of random init.  If `data/meta.json`'s fingerprint
+changed, `train.py` keeps the weights, the optimizer state and the lr
+schedule - which is driven by the cumulative samples across chunks - and
+only restarts the sample stream at epoch 0.  Checkpoints and
+`loss_history.jsonl` are kept, so the loss curve stays continuous across
+chunks.
 
 ### Loss
 

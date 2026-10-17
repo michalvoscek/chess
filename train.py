@@ -3,17 +3,22 @@
 
 Reads data/train.bin (see fen_codec.py) together with its precomputed
 legal-move CSR arrays, shuffles the sample order every epoch and trains
-with AdamW: constant weight decay on weights and embeddings, linear
-learning-rate warmup followed by cosine decay, gradient clipping at 1
-and bf16 autocast on CUDA.  Every --checkpoint-cadence samples the model
-is evaluated on a fixed slice of data/eval.bin and a checkpoint is
-written to checkpoints/ containing the optimizer state and the exact
-epoch/shuffle position so training can be resumed with --resume.  With
---resume, passes already counted in the checkpoint count toward
+with AdamW: constant weight decay on weights and embeddings, a learning
+rate that is a function of the cumulative number of samples trained -
+linear warmup, then geometric decay multiplying by --lr-decay every
+--lr-decay-samples down to a floor of 10% of the peak - gradient
+clipping at 1 and bf16 autocast on CUDA.  Every --checkpoint-cadence
+samples the model is evaluated on a fixed slice of data/eval.bin and a
+checkpoint is written to checkpoints/ containing the optimizer state and
+the exact stream position so training can be resumed with --resume.
+With --resume, passes already counted in the checkpoint count toward
 --epochs; if the checkpoint already covers them all, nothing is
-trained.  If the training data changed since the checkpoint (different
-meta.json fingerprint) the weights are kept but the stream position is
-reset.  Every progress window (~2 s) appends the mean train loss and every
+trained.  The schedule and the sample counter are cumulative across
+chunks: if the training data changed since the checkpoint (different
+meta.json fingerprint) the weights, optimizer and schedule position are
+kept while the sample stream restarts at epoch 0, so the lr continues
+exactly where the cumulative curve left off.  Every progress window
+(~2 s) appends the mean train loss and every
 checkpoint its eval loss to checkpoints/loss_history.jsonl, keyed by the
 cumulative number of samples trained; plot it with plot_loss.py.
 
@@ -25,7 +30,6 @@ Usage:
 import argparse
 import glob
 import json
-import math
 import os
 import random
 import signal
@@ -48,6 +52,8 @@ GRAD_CLIP = 1.0
 BATCH_SIZE = 512
 WARMUP_STEPS = 2000
 MIN_LR_RATIO = 0.1
+LR_DECAY = 0.9
+LR_DECAY_SAMPLES = 100_000_000
 EVAL_SAMPLES = 20_000
 KEEP_CHECKPOINTS = 2
 PROGRESS_INTERVAL = 2.0
@@ -77,6 +83,21 @@ def parse_args(argv=None):
         type=float,
         default=None,
         help="AdamW weight decay on weights and embeddings (default: 0.1, or the checkpoint's wd when resuming)",
+    )
+    parser.add_argument(
+        "--lr-decay",
+        dest="lr_decay",
+        type=float,
+        default=None,
+        help="lr multiplier per --lr-decay-samples of cumulative training "
+        "(default: 0.9; 1 keeps the lr constant)",
+    )
+    parser.add_argument(
+        "--lr-decay-samples",
+        dest="lr_decay_samples",
+        type=positive_int,
+        default=None,
+        help="cumulative samples per --lr-decay multiplier (default: 100000000)",
     )
     parser.add_argument("--batch-size", type=positive_int, default=BATCH_SIZE)
     parser.add_argument(
@@ -134,12 +155,11 @@ def legal_lists(legal_ids, offsets, indices):
     return [legal_ids[offsets[i] : offsets[i + 1]] for i in indices]
 
 
-def lr_at(step, total_steps, peak):
-    if step < WARMUP_STEPS:
-        return peak * (step + 1) / WARMUP_STEPS
-    progress = min(1.0, (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS))
-    floor = peak * MIN_LR_RATIO
-    return floor + 0.5 * (peak - floor) * (1.0 + math.cos(math.pi * progress))
+def lr_at(samples, peak, decay, decay_samples, warmup_samples):
+    """Peak-scaled lr at a cumulative sample count; geometric decay with a floor."""
+    if samples < warmup_samples:
+        return peak * (samples + 1) / warmup_samples
+    return max(peak * MIN_LR_RATIO, peak * decay ** (samples / decay_samples))
 
 
 def build_optimizer(model, lr, wd):
@@ -206,7 +226,7 @@ def latest_checkpoint_path():
     return checkpoints[-1] if checkpoints else None
 
 
-def load_checkpoint(path, fingerprint, config, model, optimizer):
+def load_checkpoint(path, config, model, optimizer):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     state = payload["state"]
     if state["config"] != config.as_dict():
@@ -217,20 +237,11 @@ def load_checkpoint(path, fingerprint, config, model, optimizer):
     if payload["rng"]["cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
     random.setstate(payload["rng"]["python"])
-    if state["fingerprint"] == fingerprint:
-        print(
-            f"resuming {path} at epoch {state['epoch']}, "
-            f"sample {state['global_samples']:,}"
-        )
-        return state
-    print(
-        f"warning: training data changed since {path}; keeping weights, "
-        "restarting the sample stream from the beginning"
-    )
-    return None
+    print(f"loaded {path} at epoch {state['epoch']}, sample {state['global_samples']:,}")
+    return state
 
 
-def make_state(fingerprint, config, epoch, step_in_epoch, perm_seed, eval_loss, lr, wd, global_steps, global_samples):
+def make_state(fingerprint, config, epoch, step_in_epoch, perm_seed, eval_loss, lr, wd, lr_decay, lr_decay_samples, global_steps, global_samples):
     return {
         "fingerprint": fingerprint,
         "config": config.as_dict(),
@@ -240,6 +251,8 @@ def make_state(fingerprint, config, epoch, step_in_epoch, perm_seed, eval_loss, 
         "eval_loss": eval_loss,
         "lr": lr,
         "wd": wd,
+        "lr_decay": lr_decay,
+        "lr_decay_samples": lr_decay_samples,
         "global_steps": global_steps,
         "global_samples": global_samples,
     }
@@ -299,39 +312,84 @@ def main():
 
     lr = args.lr if args.lr is not None else DEFAULT_LR
     wd = args.wd if args.wd is not None else DEFAULT_WD
+    lr_decay = args.lr_decay if args.lr_decay is not None else LR_DECAY
+    lr_decay_samples = (
+        args.lr_decay_samples if args.lr_decay_samples is not None else LR_DECAY_SAMPLES
+    )
     optimizer = build_optimizer(model, lr, wd)
 
     resume_state = None
+    data_changed = False
     if args.resume:
         path = latest_checkpoint_path()
         if path is None:
             sys.exit("error: --resume but checkpoints/ contains no checkpoint")
-        resume_state = load_checkpoint(path, fingerprint, config, model, optimizer)
-        if resume_state is not None:
+        resume_state = load_checkpoint(path, config, model, optimizer)
+        data_changed = resume_state["fingerprint"] != fingerprint
+        if data_changed:
+            print(
+                f"note: training data changed since {path}; keeping weights, "
+                "schedule and sample count, restarting the sample stream"
+            )
+        else:
             if resume_state.get("moves_fingerprint") not in (None, moves_fingerprint):
                 sys.exit("error: moves.json changed since the checkpoint was written")
-            if args.lr is not None:
-                lr = args.lr
-            if args.wd is not None:
-                wd = args.wd
-            for index, group in enumerate(optimizer.param_groups):
-                group["lr"] = lr
-                group["weight_decay"] = wd if index == 0 else 0.0
-            if resume_state.get("eval_loss") is not None:
-                append_history(
-                    {
-                        "kind": "eval",
-                        "samples": resume_state["global_samples"],
-                        "loss": resume_state["eval_loss"],
-                    }
+        # The schedule is cumulative across chunks: the checkpoint's values win
+        # over the defaults unless the matching flag is given explicitly.
+        lr = resume_state["lr"]
+        if args.lr is not None and args.lr != lr:
+            print(
+                f"warning: schedule peak lr stays {lr:.4g} from the checkpoint; "
+                f"--lr {args.lr:.4g} is ignored"
+            )
+        if args.wd is not None:
+            wd = args.wd
+        else:
+            wd = resume_state["wd"]
+        if resume_state.get("lr_decay") is not None:
+            if args.lr_decay is not None and args.lr_decay != resume_state["lr_decay"]:
+                print(
+                    f"warning: overriding the checkpoint's lr decay "
+                    f"{resume_state['lr_decay']:.4g} with {args.lr_decay:.4g}; "
+                    "the lr curve jumps at the resume point"
                 )
+                lr_decay = args.lr_decay
+            else:
+                lr_decay = resume_state["lr_decay"]
+        if resume_state.get("lr_decay_samples") is not None:
+            if (
+                args.lr_decay_samples is not None
+                and args.lr_decay_samples != resume_state["lr_decay_samples"]
+            ):
+                print(
+                    f"warning: overriding the checkpoint's lr decay horizon "
+                    f"{resume_state['lr_decay_samples']:,} with "
+                    f"{args.lr_decay_samples:,}; the lr curve jumps at the resume point"
+                )
+                lr_decay_samples = args.lr_decay_samples
+            else:
+                lr_decay_samples = resume_state["lr_decay_samples"]
+        for index, group in enumerate(optimizer.param_groups):
+            group["lr"] = lr
+            group["weight_decay"] = wd if index == 0 else 0.0
+        if not data_changed and resume_state.get("eval_loss") is not None:
+            append_history(
+                {
+                    "kind": "eval",
+                    "samples": resume_state["global_samples"],
+                    "loss": resume_state["eval_loss"],
+                }
+            )
     if resume_state is None:
-        # Fresh stream: drop checkpoints from earlier runs so prune_checkpoints
+        # Fresh run: drop checkpoints from earlier runs so prune_checkpoints
         # cannot delete new ones just because their sample counts are smaller.
         clear_checkpoints()
         clear_history()
 
-    print(f"optimizer peak learning rate {lr:.4g}, weight decay {wd:.4g}")
+    print(
+        f"optimizer peak learning rate {lr:.4g}, weight decay {wd:.4g}, "
+        f"lr decay {lr_decay:.4g} per {lr_decay_samples:,} samples"
+    )
 
     batch_size = args.batch_size
     steps_per_epoch = max(1, n // batch_size)
@@ -341,17 +399,9 @@ def main():
     epoch_samples = steps_per_epoch * batch_size
     start_epoch = 0
     start_step = 0
-    if resume_state is not None:
-        start_epoch = global_samples // epoch_samples
-        start_step = (global_samples % epoch_samples) // batch_size
-        if (start_epoch, start_step) != (resume_state["epoch"], resume_state["step_in_epoch"]):
-            print(
-                f"note: checkpoint position epoch {resume_state['epoch']}, "
-                f"step {resume_state['step_in_epoch']:,} disagrees with "
-                f"global_samples {global_samples:,} (train size or batch size "
-                f"changed since it was written); resuming from "
-                f"epoch {start_epoch}, step {start_step:,}"
-            )
+    if resume_state is not None and not data_changed:
+        start_epoch = resume_state["epoch"]
+        start_step = resume_state["step_in_epoch"]
     if start_epoch >= args.epochs:
         print(
             f"checkpoint has completed {start_epoch} of the {args.epochs} "
@@ -359,6 +409,8 @@ def main():
         )
         return
     done_samples = global_samples
+    stream_samples = start_epoch * epoch_samples + start_step * batch_size
+    warmup_samples = WARMUP_STEPS * batch_size
     last_saved_global = None
     next_trigger = ((global_samples // args.checkpoint_cadence) + 1) * args.checkpoint_cadence
 
@@ -369,7 +421,7 @@ def main():
     loss_count = 0
     epoch = start_epoch
     step_in_epoch = start_step
-    perm_seed = resume_state["perm_seed"] if resume_state else None
+    perm_seed = resume_state["perm_seed"] if resume_state and not data_changed else None
 
     try:
         for epoch in range(start_epoch, args.epochs):
@@ -392,7 +444,7 @@ def main():
                 loss_sum += loss.item() * len(part)
                 loss_count += len(part)
 
-                current_lr = lr_at(global_steps, total_steps, lr)
+                current_lr = lr_at(global_samples, lr, lr_decay, lr_decay_samples, warmup_samples)
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -400,11 +452,12 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_steps += 1
                 global_samples += len(part)
+                stream_samples += len(part)
 
                 now = time.monotonic()
                 if now - last_progress >= PROGRESS_INTERVAL:
                     rate = (global_samples - done_samples) / max(now - started_at, 1e-9)
-                    remaining = max(total_steps * batch_size - global_samples, 0)
+                    remaining = max(total_steps * batch_size - stream_samples, 0)
                     mean_loss = loss_sum / max(loss_count, 1)
                     append_history(
                         {
@@ -440,7 +493,8 @@ def main():
                         next_epoch, next_step = epoch + 1, 0
                     state = make_state(
                         fingerprint, config, next_epoch, next_step, perm_seed,
-                        eval_loss, lr, wd, global_steps, global_samples,
+                        eval_loss, lr, wd, lr_decay, lr_decay_samples,
+                        global_steps, global_samples,
                     )
                     state["moves_fingerprint"] = moves_fingerprint
                     path = save_checkpoint(model, optimizer, state)
@@ -456,7 +510,8 @@ def main():
         print("\ninterrupted; saving checkpoint")
         state = make_state(
             fingerprint, config, epoch, step_in_epoch + 1, perm_seed,
-            None, lr, wd, global_steps, global_samples,
+            None, lr, wd, lr_decay, lr_decay_samples,
+            global_steps, global_samples,
         )
         state["moves_fingerprint"] = moves_fingerprint
         if last_saved_global != global_samples:
@@ -472,7 +527,8 @@ def main():
             )
         state = make_state(
             fingerprint, config, args.epochs, 0, perm_seed,
-            eval_loss, lr, wd, global_steps, global_samples,
+            eval_loss, lr, wd, lr_decay, lr_decay_samples,
+            global_steps, global_samples,
         )
         state["moves_fingerprint"] = moves_fingerprint
         path = save_checkpoint(model, optimizer, state)
