@@ -3,3 +3,11 @@ data/
 __pycache__/
 checkpoints/
 plots/
+
+# LaTeX build artifacts (paper/)
+paper/*.aux
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.log
+paper/*.out
+paper/*.toc
