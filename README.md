@@ -53,7 +53,7 @@ position is precomputed so training never needs `python-chess`.
 
 args:
 --max-games: limit games in output files
---skip-games: discard the first N valid games of the stream first (chunk k of an archive at 2M games per chunk uses `--skip-games 2000000 * (k - 1)`)
+--skip-games: discard the first N header-valid games of the stream first (chunk k of an archive at 2M games per chunk uses `--skip-games 2000000 * (k - 1)`)
 --input: source `.pgn.zst` file
 
 ### Generate move vocabulary

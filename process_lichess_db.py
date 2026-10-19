@@ -16,7 +16,7 @@ Writes binary shards into data/:
 Games are assigned in input order: the first 90 percent of valid games go to
 training and the remaining 10 percent to evaluation.  The legal move id list
 of every position is precomputed so the training loop never needs python-chess.
---skip-games discards the first N valid games of the stream first, so
+--skip-games discards the first N header-valid games of the stream first, so
 successive chunks of the same archive pick up where the previous chunk
 ended (chunk k at 2000000 games per chunk uses --skip-games 2000000 * (k - 1)).
 """
@@ -64,7 +64,7 @@ def parse_args(argv=None):
         dest="skip_games",
         type=positive_int,
         default=0,
-        help="discard the first N valid games of the stream before processing",
+        help="discard the first N header-valid games of the stream before processing",
     )
     return parser.parse_args(argv)
 
@@ -193,20 +193,20 @@ def render_progress(games, max_games, samples, skipped, started_at):
 
 
 def skip_games(pgn_file, count):
-    """Discard the first count valid games of the stream (header-level check)."""
+    """Discard the first count header-valid games of the stream."""
     raw_games = 0
     valid_games = 0
     started_at = time.monotonic()
     last_progress = started_at
     progress_written = False
     while valid_games < count:
-        game = chess.pgn.read_game(pgn_file)
-        if game is None:
+        headers = chess.pgn.read_headers(pgn_file)
+        if headers is None:
             sys.exit(f"error: input ended after {valid_games:,} of {count:,} games to skip")
         raw_games += 1
-        white_elo = elo_index(game.headers.get("WhiteElo"))
-        black_elo = elo_index(game.headers.get("BlackElo"))
-        if white_elo is not None and black_elo is not None and not game.errors:
+        white_elo = elo_index(headers.get("WhiteElo"))
+        black_elo = elo_index(headers.get("BlackElo"))
+        if white_elo is not None and black_elo is not None:
             valid_games += 1
         now = time.monotonic()
         if now - last_progress >= PROGRESS_INTERVAL:
